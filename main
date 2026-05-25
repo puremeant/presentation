@@ -1,0 +1,129 @@
+import pandas as pd
+import numpy as np
+
+sheet_id = "1-wmStGZHLx55dSYi3gQK2vb3F8dMw_Nb"
+sheet_name = "Sheet1"
+
+url = (
+    f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?"
+    f"tqx=out:csv&sheet={sheet_name}"
+)
+print(url)
+df = pd.read_csv(url)
+df.columns.values[0] = 'date'
+df.columns = df.columns.str.strip()
+
+##### Preprocessing: Keep only maturities every 12 months: 12m, 24m, ..., 360m
+cols = ['date', '12 m', '24 m', '36 m', '48 m', '60 m', '72 m', '84 m', '96 m', '108 m', '120 m']
+df = df[cols] /100
+print(df)
+
+df['p12'] = -1 * df['12 m']
+df['p24'] = -2 * df['24 m']
+df['p36'] = -3 * df['36 m']
+df['p48'] = -4 * df['48 m']
+df['p60'] = -5 * df['60 m']
+df['p72'] = -6 * df['72 m']
+df['p84'] = -7 * df['84 m']
+df['p96'] = -8 * df['96 m']
+df['p108'] = -9 * df['108 m']
+df['p120'] = -10 * df['120 m']
+
+df['p12_next_year']= df['p12'].shift(-12)
+df['p24_next_year']= df['p24'].shift(-12)
+df['p36_next_year']= df['p36'].shift(-12)
+df['p48_next_year']= df['p48'].shift(-12)
+df['p60_next_year']= df['p60'].shift(-12)
+df['p72_next_year']= df['p72'].shift(-12)
+df['p84_next_year']= df['p84'].shift(-12)
+df['p96_next_year']= df['p96'].shift(-12)
+df['p108_next_year']= df['p108'].shift(-12)
+df['p120_next_year']= df['p120'].shift(-12)
+
+df['xr24'] = df['p12_next_year'] - df['p24'] - df['12 m']
+df['xr36'] = df['p24_next_year'] - df['p36'] - df['12 m']
+df['xr48'] = df['p36_next_year'] - df['p48'] - df['12 m']
+df['xr60'] = df['p48_next_year'] - df['p60'] - df['12 m']
+df['xr72'] = df['p60_next_year'] - df['p72'] - df['12 m']
+df['xr84'] = df['p72_next_year'] - df['p84'] - df['12 m']
+df['xr96'] = df['p84_next_year'] - df['p96'] - df['12 m']
+df['xr108'] = df['p96_next_year'] - df['p108'] - df['12 m']
+df['xr120'] = df['p108_next_year'] - df['p120'] - df['12 m']
+
+
+df['0f1'] = df['12 m']
+df['1f1'] = df['p12'] - df['p24']
+df['2f1'] = df['p24'] - df['p36']
+df['3f1'] = df['p36'] - df['p48']
+df['4f1'] = df['p48'] - df['p60']
+df['5f1'] = df['p60'] - df['p72']
+df['6f1'] = df['p72'] - df['p84']
+df['7f1'] = df['p84'] - df['p96']
+df['8f1'] = df['p96'] - df['p108']
+df['9f1'] = df['p108'] - df['p120']
+
+fwd_cols = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+xr_cols = ['xr24', 'xr36', 'xr48', 'xr60', 'xr72', 'xr84', 'xr96', 'xr108', 'xr120']
+data = df[["date"] + fwd_cols + xr_cols].copy()
+data = data[(data["date"] >= 1971.08) & (data["date"] <= 2018.12)]
+
+data.to_csv('./data_soo.csv', index=False)
+
+
+##### Random Forest #####
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from matplotlib import pyplot as plt
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator/denominator)
+
+df = pd.read_csv('../DATA/data_soo.csv')
+
+# RF
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date")
+dates = df_sort["date"]
+
+date_idx = df_sort[df_sort["date"] ==1989.01].index[0]
+
+pred_list =[]
+true_list =[]
+date_list = []
+history_mean_list = []
+r2_score_list =[]
+
+for y in y_columns:
+
+    for t in dates.iloc[date_idx:]:
+        train = df_sort[df_sort["date"] < t]
+        test = df_sort[df_sort["date"] == t]
+
+        x_train = train[x_columns]
+        y_train = train[y]
+
+        x_test = test[x_columns]
+        y_test = test[y]
+        y_train_hist_mean = np.mean(y_train)
+
+        rf_model = RandomForestRegressor(random_state=0, n_estimators=20)
+        rf_model.fit(x_train, y_train)
+        y_pred = rf_model.predict(x_test)
+
+        pred_list.append(y_pred[0])
+        true_list.append(y_test.iloc[0])
+        date_list.append(t)
+        history_mean_list.append(y_train_hist_mean)
+
+    df_out = pd.DataFrame({'date': date_list, 'prediction': pred_list, 'true': true_list, 'history_mean': history_mean_list})
+
+    r2_score = r2_oos(df_out['true'], df_out['prediction'], df_out['history_mean'])
+    r2_score_list.append(r2_score)
+print(r2_score_list)
+
