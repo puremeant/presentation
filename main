@@ -70,6 +70,76 @@ data = data[(data["date"] >= 1971.08) & (data["date"] <= 2018.12)]
 data.to_csv('./data_soo.csv', index=False)
 
 
+##### PCA and Linear Regression #####
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from matplotlib import pyplot as plt
+
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator/denominator)
+
+df = pd.read_csv('../DATA/data_soo.csv')
+
+# PCA(3), Linear
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date")
+dates = df_sort["date"]
+
+pred_list =[]
+true_list = []
+date_list = []
+history_mean_list = []
+r2_score_list =[]
+
+date_idx = df_sort[df_sort["date"] ==1989.01].index[0]
+
+for y in y_columns:
+
+    for t in dates.iloc[date_idx:]:
+        train = df_sort[df_sort["date"] < t]
+        test = df_sort[df_sort["date"] == t]
+
+        x_train = train[x_columns]
+        y_train = train[[y]]
+
+        x_test = test[x_columns]
+        y_test = test[[y]]
+        y_train_hist_mean = np.mean(y_train)
+
+        pca_model = PCA(n_components=3)
+        pca_model.fit(x_train)
+        x_train_pca = pca_model.transform(x_train)
+        x_test_pca = pca_model.transform(x_test)
+
+        # linear_model = LinearRegression()
+        linear_model = Lasso(alpha=0.0001)
+        linear_model.fit(x_train_pca, y_train)
+        y_pred = linear_model.predict(x_test_pca)
+
+        pred_list.append(y_pred[0])
+        true_list.append(y_test[y].iloc[0])
+        date_list.append(t)
+        history_mean_list.append(y_train_hist_mean)
+
+    df_out = pd.DataFrame({'date': date_list,
+        'true': true_list,
+        'predict': pred_list,
+        'history_mean': history_mean_list})
+
+    r2_score = r2_oos(df_out['true'], df_out['predict'], df_out['history_mean'])
+    r2_score_list.append(r2_score)
+print(r2_score_list)
+
+
+
+
 ##### Random Forest #####
 
 import numpy as np
