@@ -336,3 +336,268 @@ for y in y_columns:
     r2_score_list.append(r2_score)
 print(r2_score_list)
 
+
+##### RNN #####
+
+from tensorflow import keras
+import gc
+import os
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+
+class RNNModel:
+    def __init__(self, x_dim, y_dim, h_dim, n_layers, n_seq,
+                 act='gelu', l1=0.0, l2=1e-4, dropout=0.0, lr=1e-4,
+                 epochs=1000, batch_size=32, patience=50):
+        self.x_dim = x_dim
+        self.y_dim = y_dim
+        self.h_dim = h_dim
+        self.n_seq = n_seq
+        self.n_layers = n_layers
+        self.act = act
+        self.l1 = l1
+        self.l2 = l2
+        self.dropout = dropout
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.patience = patience
+        self.model = None
+
+    def fit(self, x_train, y_train):
+        self.model = self.build()
+        self.model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.lr),
+            loss='mse'
+        )
+        self.model.fit(
+            x_train,
+            y_train,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            shuffle=False,
+            verbose=0,
+            callbacks=[
+                keras.callbacks.EarlyStopping(
+                    monitor='loss',
+                    patience=self.patience,
+                    restore_best_weights=True
+                )
+            ]
+        )
+
+    def build(self):
+        input_layer = keras.layers.Input(shape=(self.n_seq, self.x_dim,))
+        hidden_layer = input_layer
+
+        for _ in range(self.n_layers):
+            hidden_layer = keras.layers.LSTM(32, return_sequences=True)(hidden_layer)
+            hidden_layer = keras.layers.LayerNormalization()(hidden_layer)
+            if self.dropout > 0:
+                hidden_layer = keras.layers.Dropout(self.dropout)(hidden_layer)
+        rep_layer = keras.layers.LSTM(self.h_dim, return_sequences=False)(hidden_layer)
+        rep_layer = keras.layers.LayerNormalization()(rep_layer)
+        state_layer = keras.layers.Dense(1, activation='linear')(rep_layer)
+        hidden_layer2 = keras.layers.Dense(self.h_dim, activation=self.act)(rep_layer)
+        output_layer = keras.layers.Dense(self.y_dim, activation='linear')(hidden_layer2)
+        return keras.Model(input_layer, [state_layer, output_layer])
+
+    def predict(self, x_test):
+        return self.model.predict(x_test, verbose=0)
+
+    def reset(self):
+        if self.model is not None:
+            del self.model
+            self.model = None
+        keras.backend.clear_session()
+        gc.collect()
+
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+
+    if denominator == 0:
+        return np.nan
+
+    return 1 - numerator / denominator
+
+
+def make_rnn_sequences(df, feature_cols, y_cols, lookback=12):
+    x, y, target_dates = [], [], []
+
+    values_x = df[feature_cols].values
+    values_y = df[y_cols].values
+    dates = df["date"].values
+
+    for j in range(lookback, len(df)):
+        x_seq = values_x[j - lookback:j]
+        y_target = values_y[j]
+
+        if np.isnan(x_seq).any() or np.isnan(y_target).any():
+            continue
+
+        x.append(x_seq)
+        y.append(y_target)
+        target_dates.append(dates[j])
+
+    return np.array(x), np.array(y), np.array(target_dates)
+
+
+def recursive_forecast(data, x_cols, y_cols, model, start_date=199001,
+                       min_train_size=60, min_val_size=12):
+    lookback = 12
+    df = data.copy().sort_values('date').reset_index(drop=True)
+    oos_idx = df.index[df['date'] >= start_date]
+
+    df_outs = []
+    for num_idx, i in enumerate(oos_idx):
+        date = df['date'].iloc[i]
+        print(y_cols, date, flush=True)
+        train = df.iloc[:i].dropna(subset=x_cols + y_cols)
+        test = df.iloc[[i]].dropna(subset=x_cols + y_cols)
+
+        state_x_train, state_y_train = [], []
+        for j in range(lookback, train.shape[0]):
+            x_seq_train = train[x_cols].values[j - lookback:j]
+            y_seq_train = train[x_cols].values[j]
+
+            state_x_train.append(x_seq_train)
+            state_y_train.append(y_seq_train)
+        state_x_train = np.array(state_x_train)
+        state_y_train = np.array(state_y_train)
+
+        state_x_test = np.concatenate([state_x_train[-1:, 1:], state_y_train[-1:, np.newaxis, :]], axis=1)
+        state_y_test = test[x_cols].values
+        print(state_x_train.shape, state_y_train.shape, state_x_test.shape, state_y_test.shape)
+
+        xr_y_train = train[y_cols].values[lookback:]
+        xr_y_test = test[y_cols].values
+
+        state_x_scalers = []
+        xr_scaler = StandardScaler()
+        for i in range(lookback):
+            state_scaler = MinMaxScaler()
+            state_x_train[:, i, :] = state_scaler.fit_transform(state_x_train[:, i, :])
+            state_x_test[:, i, :] = state_scaler.transform(state_x_test[:, i, :])
+            state_x_scalers.append(state_scaler)
+        xr_y_train = xr_scaler.fit_transform(xr_y_train)
+
+        model.fit(state_x_train, [state_y_train, xr_y_train])
+        pred_state, pred_xr = model.predict(state_x_test)
+        print(pred_xr.shape)
+        pred_xr = xr_scaler.inverse_transform(pred_xr)
+
+        model.reset()
+        hist_mean = np.mean(train[y_cols].values, axis=0, keepdims=True)
+        df_out = pd.DataFrame(columns=['date'] + [f'y_true_{y_col}' for y_col in y_cols]
+                                      + [f'y_pred_{y_col}' for y_col in y_cols]
+                                      + [f'hist_mean_{y_col}' for y_col in y_cols], index=range(1))
+
+        df_out['date'] = date
+        df_out[[f'y_true_{y_col}' for y_col in y_cols]] = xr_y_test
+        df_out[[f'y_pred_{y_col}' for y_col in y_cols]] = pred_xr
+        df_out[[f'hist_mean_{y_col}' for y_col in y_cols]] = hist_mean
+
+        df_out.to_csv(f'./TEMP/out_{date}.csv', index=False)
+        df_outs.append(df_out)
+
+    df_outs = pd.concat(df_outs, axis=0, ignore_index=True)
+
+    return df_outs
+
+
+def plot_time_series(df, model_name, y_col):
+    x_date = pd.to_datetime(df['date'].astype(str), format='%Y%m')
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(x_date, df[f'y_true_{y_col}'].values, 'k', label='True')
+    plt.plot(x_date, df[f'y_pred_{y_col}'].values, 'r', label='Pred')
+    plt.plot(x_date, df[f'hist_mean_{y_col}'].values, 'b', label='Hist Mean')
+
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+
+    plt.xticks(rotation=90)
+    plt.ylabel(f'{y_col}')
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(f'./PLOT/{model_name}_xr_{y_col}.png')
+    plt.close()
+
+
+def plot_prediction_scatter(df, model_name, y_col):
+    vmin = min(df[f'y_true_{y_col}'].min(), df[f'y_pred_{y_col}'].min())
+    vmax = max(df[f'y_true_{y_col}'].max(), df[f'y_pred_{y_col}'].max())
+
+    plt.figure(figsize=(5, 5))
+    plt.plot(df[f'y_true_{y_col}'].values, df[f'y_pred_{y_col}'].values, 'ko')
+    plt.plot([vmin, vmax], [vmin, vmax], 'k')
+
+    plt.xlim(vmin * 1.1, vmax * 1.1)
+    plt.ylim(vmin * 1.1, vmax * 1.1)
+
+    plt.xlabel('y_true')
+    plt.ylabel('y_pred')
+    plt.tight_layout()
+    plt.savefig(f'./PLOT/{model_name}_r2_{y_col}.png')
+    plt.close()
+
+
+if __name__ == '__main__':
+    os.makedirs('./OUT', exist_ok=True)
+
+    target_years = np.array([2, 3, 4, 5, 7, 10])
+    y_cols = [f'xr{val}' for val in target_years]
+    # target_years = np.array([10])
+    fwd_cols = [f'f{i}' for i in range(1, 11)]
+
+    data = pd.read_csv('../DATA/data.csv')
+    # data = data[data['date'] < 199006].reset_index(drop=True)
+
+    h_dim, n_layers = 64, 2
+    model_name = f'RNN_{h_dim}_{n_layers}'
+
+    results = []
+
+    model = RNNModel(
+        x_dim=len(fwd_cols),
+        y_dim=len(y_cols),
+        h_dim=h_dim,
+        n_seq=12,
+        n_layers=n_layers,
+        act='gelu',
+        dropout=0.0,
+        lr=1e-4,
+        epochs=1000,
+        batch_size=32,
+        patience=100
+    )
+
+    df = recursive_forecast(
+        data,
+        fwd_cols,
+        y_cols,
+        model,
+        start_date=200001, # 199001
+        min_train_size=60,
+        min_val_size=12
+    )
+    score_list = []
+    for y_col in y_cols:
+        score = r2_oos(df[f'y_true_{y_col}'], df[f'y_pred_{y_col}'], df[f'hist_mean_{y_col}'])
+        print(score)
+        plot_time_series(df, model_name, y_col)
+        plot_prediction_scatter(df, model_name, y_col)
+        score_list.append(score)
+    df_out = pd.DataFrame(columns=[y_col for y_col in y_cols], data=[score_list])
+    df_out.to_csv('./OUT/score.csv', index=False)
