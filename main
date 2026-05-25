@@ -127,3 +127,142 @@ for y in y_columns:
     r2_score_list.append(r2_score)
 print(r2_score_list)
 
+
+
+##### Neural Network #####
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from matplotlib import pyplot as plt
+from tensorflow import keras
+import gc
+
+
+class Model:
+    def __init__(self, x_dim, y_dim, h_dim, n_layers,
+                 act='relu', l1=0.0, l2=1e-4, dropout=0.0, lr=1e-4,
+                 epochs=1000, batch_size=32, patience=50):
+        self.x_dim = x_dim
+        self.y_dim = y_dim
+        self.h_dim = h_dim
+        self.n_layers = n_layers
+        self.act = act
+        self.l1 = l1
+        self.l2 = l2
+        self.dropout = dropout
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.patience = patience
+        self.model = None
+
+    def fit(self, x_train, y_train, x_val, y_val):
+        self.model = self.build()
+        self.model.compile(
+            optimizer=keras.optimizers.legacy.SGD(learning_rate=self.lr, momentum=0.9, decay=0.01, nesterov=True),
+            loss='mse'
+        )
+        self.model.fit(
+            x_train,
+            y_train,
+            validation_data=(x_val, y_val),
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            shuffle=False,
+            verbose=1,
+            callbacks=[
+                keras.callbacks.EarlyStopping(
+                    monitor='val_loss',
+                    patience=self.patience,
+                    restore_best_weights=True
+                )
+            ]
+        )
+
+    def build(self):
+        input_layer = keras.layers.Input(shape=(self.x_dim,))
+        hidden_layer = input_layer
+
+        for _ in range(self.n_layers):
+            hidden_layer = keras.layers.Dense(
+                self.h_dim,
+                activation=self.act,
+                kernel_regularizer=keras.regularizers.L1L2(
+                    l1=self.l1,
+                    l2=self.l2
+                ),
+                bias_initializer='he_normal', kernel_initializer='he_normal'
+            )(hidden_layer)
+
+            if self.dropout > 0:
+                hidden_layer = keras.layers.Dropout(self.dropout)(hidden_layer)
+
+        output_layer = keras.layers.Dense(self.y_dim, activation='linear')(hidden_layer)
+        return keras.Model(input_layer, output_layer)
+
+    def predict(self, x_test):
+        return self.model.predict(x_test, verbose=0)
+
+    def reset(self):
+        if self.model is not None:
+            del self.model
+            self.model = None
+        keras.backend.clear_session()
+        gc.collect()
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator/denominator)
+
+df = pd.read_csv('../DATA/data_soo.csv')
+
+# RF
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date")
+dates = df_sort["date"]
+
+date_idx = df_sort[df_sort["date"] ==1989.01].index[0]
+
+pred_list =[]
+true_list =[]
+date_list = []
+history_mean_list = []
+r2_score_list =[]
+
+for y in y_columns:
+
+    for t in dates.iloc[date_idx:]:
+        train = df_sort[df_sort["date"] < t]
+        test = df_sort[df_sort["date"] == t]
+
+        x_train = train[x_columns]
+        num = int(len(x_train) * 0.85)
+        y_train = train[y]
+
+        x_train, x_val = x_train[:num], x_train[num:]
+        y_train, y_val = y_train[:num], y_train[num:]
+
+        x_test = test[x_columns]
+        y_test = test[y]
+        y_train_hist_mean = np.mean(y_train)
+
+        nn_model = Model(x_dim=len(x_columns), y_dim=1, h_dim=3, n_layers=1,
+                 act='relu', l1=0.01, l2= 0.01, dropout=0.1, lr=1e-2,
+                 epochs=1, batch_size=32, patience=20)
+        nn_model.fit(x_train, y_train, x_val, y_val)
+        y_pred = nn_model.predict(x_test)
+
+        pred_list.append(y_pred[0])
+        true_list.append(y_test.iloc[0])
+        date_list.append(t)
+        history_mean_list.append(y_train_hist_mean)
+
+    df_out = pd.DataFrame({'date': date_list, 'prediction': pred_list, 'true': true_list, 'history_mean': history_mean_list})
+
+    r2_score = r2_oos(df_out['true'], df_out['prediction'], df_out['history_mean'])
+    r2_score_list.append(r2_score)
+print(r2_score_list)
+
