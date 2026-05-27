@@ -1,0 +1,155 @@
+##### Random Forest #####
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from matplotlib import pyplot as plt
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator/denominator)
+
+df = pd.read_csv('/content/sample_data/data_soo.csv')
+
+# RF
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date")
+dates = df_sort["date"]
+
+date_idx = df_sort[df_sort["date"] ==1990.01].index[0]
+
+r2_score_list =[]
+
+for y in y_columns:
+
+    pred_list =[]
+    true_list =[]
+    date_list = []
+    history_mean_list = []
+
+    for t in dates.iloc[date_idx:]:
+        train = df_sort[df_sort["date"] < t]
+        test = df_sort[df_sort["date"] == t]
+
+        x_train = train[x_columns]
+        y_train = train[y]
+
+        x_test = test[x_columns]
+        y_test = test[y]
+        y_train_hist_mean = np.mean(y_train)
+
+        rf_model = RandomForestRegressor(random_state=0, n_estimators=20)
+        rf_model.fit(x_train, y_train)
+        y_pred = rf_model.predict(x_test)
+
+        pred_list.append(y_pred[0])
+        true_list.append(y_test.iloc[0])
+        date_list.append(t)
+        history_mean_list.append(y_train_hist_mean)
+
+    df_out = pd.DataFrame({'date': date_list, 'prediction': pred_list, 'true': true_list, 'history_mean': history_mean_list})
+
+    r2_score = r2_oos(df_out['true'], df_out['prediction'], df_out['history_mean'])
+    r2_score_list.append(r2_score)
+
+df_score = pd.DataFrame(columns=y_columns, data=[r2_score_list])
+
+df_score.to_csv('/content/sample_data/RF_score.csv', index=False)
+
+print(r2_score_list)
+
+
+
+
+##### Elastic Net #####
+
+import os
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import ElasticNet
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator / denominator)
+
+df = pd.read_csv('/content/sample_data/data_soo.csv')
+
+# Elastic Net
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1',
+             '5f1', '6f1', '7f1', '8f1', '9f1']
+
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+dates = df_sort["date"]
+
+date_idx = df_sort[df_sort["date"] == 1990.01].index[0]
+
+r2_score_list = []
+
+for y in y_columns:
+
+    pred_list = []
+    true_list = []
+    date_list = []
+    history_mean_list = []
+
+    for t in dates.iloc[date_idx:]:
+
+        train = df_sort[df_sort["date"] < t]
+        test = df_sort[df_sort["date"] == t]
+
+        x_train = train[x_columns]
+        y_train = train[y]
+
+        x_test = test[x_columns]
+        y_test = test[y]
+
+        y_train_hist_mean = y_train.mean()
+
+        enet_model = make_pipeline(
+            StandardScaler(),
+            ElasticNet(
+                alpha=0.0001,
+                l1_ratio=0.5,
+                max_iter=10000,
+                random_state=0
+            )
+        )
+
+        enet_model.fit(x_train, y_train)
+        y_pred = enet_model.predict(x_test)
+
+        pred_list.append(y_pred[0])
+        true_list.append(y_test.iloc[0])
+        date_list.append(t)
+        history_mean_list.append(y_train_hist_mean)
+
+    df_out = pd.DataFrame({
+        'date': date_list,
+        'prediction': pred_list,
+        'true': true_list,
+        'history_mean': history_mean_list
+    })
+
+    r2_score = r2_oos(
+        df_out['true'],
+        df_out['prediction'],
+        df_out['history_mean']
+    )
+
+    r2_score_list.append(r2_score)
+
+df_score = pd.DataFrame(columns=y_columns, data=[r2_score_list])
+
+df_score.to_csv('/content/sample_data/elasticnet_score.csv', index=False)
+
+print(r2_score_list)
