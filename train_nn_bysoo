@@ -1,4 +1,8 @@
 # NN 내가 혼자 짜본거. 저자 code 고려 안함
+
+       xr24      xr36      xr48      xr60      xr84     xr120
+0 -0.870831 -0.818162 -0.849705 -0.837254 -0.810891 -0.803931
+
 ##### Neural Network: 1 hidden layer #####
 
 import os
