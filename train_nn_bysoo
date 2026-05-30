@@ -1,0 +1,95 @@
+# NN 내가 혼자 짜본거. 저자 code 고려 안함
+##### Neural Network: 1 hidden layer #####
+
+import os
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def r2_oos (y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator/denominator)
+
+def build_nn(input_dim, hidden_nodes):
+    model=keras.Sequential( [
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(hidden_nodes, activation='relu'),
+        layers.Dense(6, activation='linear')])
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+    return model
+
+df = pd.read_csv('../DATA/data_soo.csv')
+
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1', '5f1', '6f1', '7f1', '8f1', '9f1']
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+dates = df_sort["date"]
+date_idx = df_sort[df_sort["date"] == 1989.01].index[0]
+
+# Choose hidden nodes: 3 or 7
+hidden_nodes = 3
+# hidden_nodes = 7
+
+pred_list = []
+true_list = []
+date_list = []
+history_mean_list = []
+
+for t in dates.iloc[date_idx:]:
+
+    train = df_sort[df_sort["date"] < t]
+    test = df_sort[df_sort["date"] == t]
+
+    x_train = train[x_columns]
+    y_train = train[y_columns]
+    x_test = test[x_columns]
+    y_test = test[y_columns]
+
+    y_train_hist_mean = y_train.mean()
+
+    x_scaler = StandardScaler()
+    x_train_scaled = x_scaler.fit_transform(x_train)
+    x_test_scaled = x_scaler.transform(x_test)
+    y_scaler = StandardScaler()
+    y_train_scaled = y_scaler.fit_transform(y_train)
+
+    nn_model = build_nn(input_dim=len(x_columns), hidden_nodes=hidden_nodes)
+
+    nn_model.fit(x_train_scaled, y_train_scaled,
+                 epochs=500, batch_size=32,
+                 validation_split=0.15, shuffle=False, verbose=0)
+    y_pred_scaled = nn_model.predict(x_test_scaled, verbose=0)
+    y_pred = y_scaler.inverse_transform(y_pred_scaled)
+
+    pred_list.append(y_pred[0])
+    true_list.append(y_test.iloc[0].values)
+    date_list.append(t)
+    history_mean_list.append(y_train.mean().values)
+
+pred_df = pd.DataFrame(pred_list, columns=[f'pred_{y}' for y in y_columns])
+true_df = pd.DataFrame(true_list, columns=[f'true_{y}' for y in y_columns])
+hist_df = pd.DataFrame(history_mean_list, columns=[f'hist_{y}' for y in y_columns])
+df_out = pd.concat(
+    [pd.DataFrame({'date':date_list}), pred_df, true_df, hist_df], axis=1)
+
+r2_score_list = []
+for y in y_columns:
+    r2_score = r2_oos(df_out[f'true_{y}'], df_out[f'pred_{y}'],df_out[f'hist_{y}'])
+    r2_score_list.append(r2_score)
+df_score = pd.DataFrame(columns=y_columns, data=[r2_score_list] )
+
+os.makedirs('./NN/', exist_ok=True)
+
+if hidden_nodes == 3:
+    df_score.to_csv('./NN/nn_1layer_3nodes_score.csv', index=False)
+else:
+    df_score.to_csv('./NN/nn_1layer_7nodes_score.csv', index=False)
+
+print(r2_score_list)
+print(df_score)
