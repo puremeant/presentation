@@ -1,5 +1,20 @@
-##### Neural Network: 1 hidden layer, yield-only, ensemble version #####
-##### restart-safe version #####
+##### Neural Network: 1 hidden layer, yield-only, author-style ensemble #####
+##### PyCharm main version / Colab lines are commented #####
+
+# ---------------------------------------------------------
+1. OOS 시작점 맞게 반영
+2. Expanding-window OOS 구조
+3. 오로지 forward rate = X, yield = y. 저자는 X에 macro variable 추가
+4. multi-output forecasting: xr 전체 6개 넣고 돌리기
+5. NN ensemble : 저자는 nMC = 100, nAvg = 10, 같은 모델을 여러 seed로 학습한 뒤 validation loss가 낮은 상위 nAvg개의 예측을 평균. 
+N_MC, N_AVG를 두고 seed별 prediction과 validation loss를 저장한 뒤 np.argsort(val_loss_candidates)[:N_AVG]로 top model을 골라 평균
+6. hyperparameter 후보
+7. early stopping, validation split: EarlyStopping(monitor='val_loss', min_delta=1e-6, patience=20)와 validation_split=0.15, batch_size=32, shuffle=True를 사용
+8. optimizer : 저자 NN 함수는 SGD with momentum/nesterov를 사용. 네 코드도 keras.optimizers.SGD(learning_rate=0.01, momentum=0.9, nesterov=True)
+9. HyperFreq : 첫 OOS 시점과 48개월마다 fresh hyperparameter search
+10. R2, p-value : 개념적으로는 맞지만, 저자 코드와 완전히 같은 방식은 아님 (history_mean)
+# -----------------------------------------------------------
+
 
 import os
 import gc
@@ -14,18 +29,42 @@ from tensorflow.keras import layers, regularizers
 import statsmodels.api as sm
 from scipy.stats import t as tstat
 
-## colab version
-# from google.colab import drive
-
 
 # ==================================================
-# 0. Mount Google Drive
+# 0. Settings
 # ==================================================
 
-# drive.mount('/content/drive')
-# SAVE_DIR = '/content/drive/MyDrive/AP/Paper/bond_nn_results'
+# ---------- PyCharm version ----------
 SAVE_DIR = './NN'
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------- Colab version ----------
+# from google.colab import drive
+# drive.mount('/content/drive')
+# SAVE_DIR = '/content/drive/MyDrive/AP/Paper/bond_nn_results'
+# os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# 테스트용
+N_MC = 2
+N_AVG = 1
+
+# 저자 스타일 최종 버전
+# N_MC = 100
+# N_AVG = 10
+
+HYPER_FREQ = 4 * 12
+
+NN_PARAMS = {
+    'Dropout': [0.1, 0.3, 0.5],
+    'l1l2': [0.01, 0.001]
+}
+
+# NN - 1 layer, 3 nodes
+hidden_nodes = 3
+
+# NN - 1 layer, 7 nodes로 돌리고 싶으면 위 줄 대신 아래 줄 사용
+# hidden_nodes = 7
 
 
 # ==================================================
@@ -52,7 +91,7 @@ def rsz_signif(y_true, y_forecast, y_hist_mean):
 
 
 # ==================================================
-# 2. Build neural network
+# 2. Build NN
 # ==================================================
 
 def build_nn(input_dim, hidden_nodes, output_dim, dropout_rate, penalty, seed):
@@ -80,8 +119,14 @@ def build_nn(input_dim, hidden_nodes, output_dim, dropout_rate, penalty, seed):
         )
     ])
 
+    lr_schedule = keras.optimizers.schedules.InverseTimeDecay(
+        initial_learning_rate=0.01,
+        decay_steps=1,
+        decay_rate=0.01
+    )
+
     optimizer = keras.optimizers.SGD(
-        learning_rate=0.01,
+        learning_rate=lr_schedule,
         momentum=0.9,
         nesterov=True
     )
@@ -95,74 +140,99 @@ def build_nn(input_dim, hidden_nodes, output_dim, dropout_rate, penalty, seed):
 
 
 # ==================================================
-# 3. Train one NN with hyperparameter tuning
+# 3. Fit one NN with given hyperparameters
 # ==================================================
 
-def train_one_nn(x_train_scaled, y_train_scaled, x_test_scaled,
-                 hidden_nodes, seed):
+def fit_one_nn(x_train_scaled, y_train_scaled, x_test_scaled,
+               hidden_nodes, seed, dropout_rate, penalty):
 
-    dropout_grid = [0.1, 0.3, 0.5]
-    penalty_grid = [0.01, 0.001]
+    keras.backend.clear_session()
+
+    nn_model = build_nn(
+        input_dim=x_train_scaled.shape[1],
+        hidden_nodes=hidden_nodes,
+        output_dim=y_train_scaled.shape[1],
+        dropout_rate=dropout_rate,
+        penalty=penalty,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        min_delta=1e-6,
+        patience=20,
+        verbose=0,
+        mode='auto',
+        restore_best_weights=True
+    )
+
+    history = nn_model.fit(
+        x_train_scaled,
+        y_train_scaled,
+        epochs=20,        # 테스트용. 최종은 500으로 변경.
+        batch_size=32,
+        validation_split=0.15,
+        shuffle=True,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    val_loss = min(history.history['val_loss'])
+    pred_scaled = nn_model.predict(x_test_scaled, verbose=0)
+
+    del nn_model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return pred_scaled, val_loss
+
+
+# ==================================================
+# 4. Hyperparameter search for one seed
+# ==================================================
+
+def grid_search_one_seed(x_train_scaled, y_train_scaled, x_test_scaled,
+                         hidden_nodes, seed):
 
     best_val_loss = np.inf
     best_pred_scaled = None
+    best_dropout = None
+    best_penalty = None
 
-    for dropout_rate in dropout_grid:
-        for penalty in penalty_grid:
+    for dropout_rate in NN_PARAMS['Dropout']:
+        for penalty in NN_PARAMS['l1l2']:
 
-            keras.backend.clear_session()
-
-            nn_model = build_nn(
-                input_dim=x_train_scaled.shape[1],
+            pred_scaled, val_loss = fit_one_nn(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
                 hidden_nodes=hidden_nodes,
-                output_dim=y_train_scaled.shape[1],
+                seed=seed,
                 dropout_rate=dropout_rate,
-                penalty=penalty,
-                seed=seed
+                penalty=penalty
             )
-
-            early_stop = keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                min_delta=1e-6,
-                patience=20,
-                verbose=0,
-                mode='auto',
-                restore_best_weights=True
-            )
-
-            history = nn_model.fit(
-                x_train_scaled,
-                y_train_scaled,
-                epochs=20,              # 테스트용. 최종은 500으로 바꿔도 됨.
-                batch_size=32,
-                validation_split=0.15,
-                shuffle=True,
-                verbose=0,
-                callbacks=[early_stop]
-            )
-
-            val_loss = min(history.history['val_loss'])
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_pred_scaled = nn_model.predict(x_test_scaled, verbose=0)
+                best_pred_scaled = pred_scaled
+                best_dropout = dropout_rate
+                best_penalty = penalty
 
-            del nn_model
-            keras.backend.clear_session()
-            gc.collect()
-
-    return best_pred_scaled, best_val_loss
+    return best_pred_scaled, best_val_loss, best_dropout, best_penalty
 
 
 # ==================================================
-# 4. Load data
+# 5. Load data
 # ==================================================
 
+# ---------- PyCharm version ----------
 df = pd.read_csv('../DATA/data_soo.csv')
-## colab version
-#file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
-#url = f"https://drive.google.com/uc?id={file_id}"
-#df = pd.read_csv(url)
+
+# ---------- Colab version ----------
+# file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+# url = f"https://drive.google.com/uc?id={file_id}"
+# df = pd.read_csv(url)
+
 
 x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1',
              '5f1', '6f1', '7f1', '8f1', '9f1']
@@ -173,35 +243,18 @@ df_sort = df.copy().sort_values("date").reset_index(drop=True)
 df_sort["date"] = df_sort["date"].round(2)
 
 dates = df_sort["date"]
-
 date_idx = df_sort[df_sort["date"] == 1989.01].index[0]
 
 
 # ==================================================
-# 5. Settings
+# 6. Recursive OOS forecasting
 # ==================================================
 
-# 테스트용
-N_MC = 2
-N_AVG = 1
+# seed별로 마지막 선택된 hyperparameter 저장
+saved_dropout = {}
+saved_penalty = {}
 
-# 최종 저자 스타일로 돌릴 때는 아래처럼 바꾸기
-# N_MC = 100
-# N_AVG = 10
-
-# NN - 1 layer, 3 nodes
-hidden_nodes = 3
-
-# NN - 1 layer, 7 nodes로 돌리고 싶으면 위 줄 대신 아래 줄 사용
-# hidden_nodes = 7
-
-
-# ==================================================
-# 6. Recursive expanding-window OOS forecasting
-#    Save each date separately so Colab can resume
-# ==================================================
-
-for t in dates.iloc[date_idx:]:
+for step_no, t in enumerate(dates.iloc[date_idx:], start=1):
 
     date_str = f"{t:.2f}".replace(".", "_")
 
@@ -218,6 +271,14 @@ for t in dates.iloc[date_idx:]:
         continue
 
     print("Forecasting date:", t)
+
+    # 저자식: 첫 번째 OOS date 또는 48개월마다 hyperparameter search
+    if (step_no == 1) or (step_no % HYPER_FREQ == 0):
+        refit = True
+    else:
+        refit = False
+
+    print("  Refit hyperparameters:", refit)
 
     train = df_sort[df_sort["date"] < t]
     test = df_sort[df_sort["date"] == t]
@@ -245,13 +306,40 @@ for t in dates.iloc[date_idx:]:
     for seed in range(N_MC):
         print("  NN seed:", seed)
 
-        pred_scaled, val_loss = train_one_nn(
-            x_train_scaled=x_train_scaled,
-            y_train_scaled=y_train_scaled,
-            x_test_scaled=x_test_scaled,
-            hidden_nodes=hidden_nodes,
-            seed=seed
-        )
+        if refit or (seed not in saved_dropout):
+
+            pred_scaled, val_loss, best_dropout, best_penalty = grid_search_one_seed(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
+                hidden_nodes=hidden_nodes,
+                seed=seed
+            )
+
+            saved_dropout[seed] = best_dropout
+            saved_penalty[seed] = best_penalty
+
+            print("    Best params:",
+                  "dropout =", best_dropout,
+                  "penalty =", best_penalty)
+
+        else:
+            best_dropout = saved_dropout[seed]
+            best_penalty = saved_penalty[seed]
+
+            pred_scaled, val_loss = fit_one_nn(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
+                hidden_nodes=hidden_nodes,
+                seed=seed,
+                dropout_rate=best_dropout,
+                penalty=best_penalty
+            )
+
+            print("    Reused params:",
+                  "dropout =", best_dropout,
+                  "penalty =", best_penalty)
 
         pred_candidates.append(pred_scaled[0])
         val_loss_candidates.append(val_loss)
@@ -286,7 +374,7 @@ for t in dates.iloc[date_idx:]:
 
 
 # ==================================================
-# 7. Load saved date-by-date results
+# 7. Load saved results
 # ==================================================
 
 pattern = (
@@ -297,8 +385,9 @@ pattern = (
 )
 
 files = sorted(glob.glob(pattern))
+
 if len(files) == 0:
-    raise ValueError("No saved result files found. Check whether the forecasting loop saved any result_*.csv files.")
+    raise ValueError("No saved result files found.")
 
 df_out = pd.concat(
     [pd.read_csv(f) for f in files],
@@ -310,7 +399,7 @@ df_out = df_out.sort_values("date").reset_index(drop=True)
 
 
 # ==================================================
-# 8. Compute R2 OOS and p-value by maturity
+# 8. Compute R2 OOS and p-value
 # ==================================================
 
 r2_score_list = []
@@ -340,7 +429,7 @@ df_score = pd.DataFrame(
 
 
 # ==================================================
-# 9. Save final combined results
+# 9. Save final results
 # ==================================================
 
 df_out.to_csv(
