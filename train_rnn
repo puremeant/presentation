@@ -1,0 +1,609 @@
+##### RNN / LSTM: yield-only, historical path + current state #####
+##### PyCharm main version / Colab lines are commented #####
+
+import os
+import gc
+import glob
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers
+
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 0. Settings
+# ==================================================
+
+# ---------- PyCharm version ----------
+SAVE_DIR = './RNN'
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------- Colab version ----------
+# from google.colab import drive
+# drive.mount('/content/drive')
+# SAVE_DIR = '/content/drive/MyDrive/AP/Paper/bond_rnn_results'
+# os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# ==================================================
+# Main RNN options
+# ==================================================
+
+# 기본값: single RNN model
+USE_ENSEMBLE = False
+
+if USE_ENSEMBLE:
+    # Optional author-style seed ensemble
+    N_MC = 100
+    N_AVG = 5
+else:
+    # Main single-model RNN
+    N_MC = 1
+    N_AVG = 1
+
+# Past path length:
+# past input = x_{t-12}, ..., x_{t-1}
+LOOKBACK = 12
+
+# LSTM architecture
+N_LAYERS = 1          # 1이면 final LSTM 하나만 사용
+H_DIM = 8             # path representation dimension
+DENSE_DIM = 8
+ACTIVATION = 'relu'
+
+# Training
+EPOCHS = 200
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+PATIENCE = 20
+
+# Evaluation period
+# If the realized return sample ends in 2018.12, the last usable predictor date is 2017.12.
+OOS_START_DATE = 1989.01
+OOS_END_DATE = 2017.12
+
+# Set this to True if your data actually contains valid realized returns for 2018 -> 2019
+# and you want to forecast through 2018.12.
+# OOS_END_DATE = 2018.12
+
+
+# ==================================================
+# 1. OOS R2 and p-value functions
+# ==================================================
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator / denominator)
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    f = ((y_true - y_hist_mean) ** 2
+         - (y_true - y_forecast) ** 2
+         + (y_hist_mean - y_forecast) ** 2)
+
+    x = np.ones(np.shape(f))
+
+    model = sm.OLS(f, x, missing='drop', hasconst=True)
+    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+
+    return 1 - tstat.cdf(results.tvalues[0], results.nobs - 1)
+
+
+# ==================================================
+# 2. Make RNN samples
+# ==================================================
+
+def make_rnn_train_samples(data, x_columns, y_columns, lookback):
+    """
+    For each target date s in the training sample:
+
+        past path     = x_{s-12}, ..., x_{s-1}
+        current state = x_s
+        target        = xr_s
+
+    This lets the RNN summarize past yield-curve states while separately
+    controlling for the current yield-curve state.
+    """
+
+    data = data.sort_values("date").reset_index(drop=True)
+
+    past_seq_list = []
+    current_x_list = []
+    y_list = []
+    target_dates = []
+
+    for current_idx in range(lookback, len(data)):
+        past_start = current_idx - lookback
+        past_end = current_idx
+
+        y_val = data.iloc[current_idx][y_columns]
+
+        # Skip rows with missing target values
+        if y_val.isna().any():
+            continue
+
+        past_seq = data.iloc[past_start:past_end][x_columns].values
+        current_x = data.iloc[current_idx][x_columns].values
+        date_val = data.iloc[current_idx]["date"]
+
+        past_seq_list.append(past_seq)
+        current_x_list.append(current_x)
+        y_list.append(y_val.values)
+        target_dates.append(date_val)
+
+    X_past = np.array(past_seq_list)
+    X_current = np.array(current_x_list)
+    Y = np.array(y_list)
+    target_dates = np.array(target_dates)
+
+    return X_past, X_current, Y, target_dates
+
+
+def make_rnn_test_sample(df_sort, test_index, x_columns, lookback):
+    """
+    For forecast date t:
+
+        past path     = x_{t-12}, ..., x_{t-1}
+        current state = x_t
+
+    The target is xr_t, which is the realized future one-year excess return
+    attached to row t.
+    """
+
+    past_start = test_index - lookback
+    past_end = test_index
+
+    if past_start < 0:
+        raise ValueError("Not enough historical observations to construct test sequence.")
+
+    X_past_test = df_sort.iloc[past_start:past_end][x_columns].values
+    X_current_test = df_sort.iloc[test_index][x_columns].values
+
+    X_past_test = X_past_test.reshape(1, lookback, len(x_columns))
+    X_current_test = X_current_test.reshape(1, len(x_columns))
+
+    return X_past_test, X_current_test
+
+
+def scale_rnn_past_sequences(x_scaler, X_past):
+    """
+    Scale 3D RNN input using a StandardScaler fitted on training X only.
+    """
+
+    n_samples, lookback, n_features = X_past.shape
+
+    X_scaled = x_scaler.transform(
+        X_past.reshape(-1, n_features)
+    ).reshape(n_samples, lookback, n_features)
+
+    return X_scaled
+
+
+# ==================================================
+# 3. Build LSTM RNN
+# ==================================================
+
+def build_lstm_rnn(lookback, x_dim, y_dim, n_layers, h_dim,
+                   dense_dim, activation, seed):
+
+    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)
+
+    # Past yield-curve path input: x_{t-12}, ..., x_{t-1}
+    past_input = keras.Input(
+        shape=(lookback, x_dim),
+        name='past_yield_curve_path'
+    )
+
+    hidden_layer = past_input
+
+    # Optional stacked LSTM layers.
+    # These keep the whole sequence so another LSTM can read it.
+    for _ in range(max(n_layers - 1, 0)):
+        hidden_layer = layers.LSTM(
+            32,
+            return_sequences=True,
+            recurrent_initializer='orthogonal'
+        )(hidden_layer)
+
+        hidden_layer = layers.LayerNormalization()(hidden_layer)
+
+    # Final LSTM summarizes the historical path into one vector.
+    rep_layer = layers.LSTM(
+        h_dim,
+        return_sequences=False,
+        recurrent_initializer='orthogonal',
+        name='path_representation_lstm'
+    )(hidden_layer)
+
+    rep_layer = layers.LayerNormalization(name='path_representation_norm')(rep_layer)
+
+    # Optional interpretable one-dimensional latent path state.
+    # This is not used as a model output for training; it can be extracted later.
+    state_layer = layers.Dense(
+        1,
+        activation='linear',
+        name='latent_path_state'
+    )(rep_layer)
+
+    # Current yield-curve state input: x_t
+    current_input = keras.Input(
+        shape=(x_dim,),
+        name='current_yield_curve_state'
+    )
+
+    # Combine path summary and current state.
+    merged = layers.Concatenate(name='merge_path_and_current')(
+        [rep_layer, current_input]
+    )
+
+    hidden_layer2 = layers.Dense(
+        dense_dim,
+        activation=activation,
+        name='forecast_hidden_layer'
+    )(merged)
+
+    output_layer = layers.Dense(
+        y_dim,
+        activation='linear',
+        name='xr_forecast'
+    )(hidden_layer2)
+
+    model = keras.Model(
+        inputs=[past_input, current_input],
+        outputs=output_layer
+    )
+
+    # Separate model to extract the latent path state if needed.
+    state_model = keras.Model(
+        inputs=[past_input, current_input],
+        outputs=state_layer
+    )
+
+    optimizer = keras.optimizers.Adam(
+        learning_rate=LEARNING_RATE
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss='mse'
+    )
+
+    return model, state_model
+
+
+# ==================================================
+# 4. Fit one RNN model
+# ==================================================
+
+def fit_one_rnn(X_past_train_scaled, X_current_train_scaled,
+                y_train_scaled,
+                X_past_test_scaled, X_current_test_scaled,
+                seed):
+
+    keras.backend.clear_session()
+
+    rnn_model, state_model = build_lstm_rnn(
+        lookback=X_past_train_scaled.shape[1],
+        x_dim=X_past_train_scaled.shape[2],
+        y_dim=y_train_scaled.shape[1],
+        n_layers=N_LAYERS,
+        h_dim=H_DIM,
+        dense_dim=DENSE_DIM,
+        activation=ACTIVATION,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        min_delta=1e-6,
+        patience=PATIENCE,
+        verbose=0,
+        mode='auto',
+        restore_best_weights=True
+    )
+
+    history = rnn_model.fit(
+        [X_past_train_scaled, X_current_train_scaled],
+        y_train_scaled,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.15,
+        shuffle=False,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    val_loss = min(history.history['val_loss'])
+
+    pred_scaled = rnn_model.predict(
+        [X_past_test_scaled, X_current_test_scaled],
+        verbose=0
+    )
+
+    path_state = state_model.predict(
+        [X_past_test_scaled, X_current_test_scaled],
+        verbose=0
+    )
+
+    del rnn_model
+    del state_model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return pred_scaled, val_loss, path_state
+
+
+# ==================================================
+# 5. Load data
+# ==================================================
+
+# ---------- PyCharm version ----------
+df = pd.read_csv('../DATA/data_soo.csv')
+
+# ---------- Colab version ----------
+# file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+# url = f"https://drive.google.com/uc?id={file_id}"
+# df = pd.read_csv(url)
+
+
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1',
+             '5f1', '6f1', '7f1', '8f1', '9f1']
+
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+# Keep only rows where X exists.
+df_sort = df_sort.dropna(subset=x_columns).reset_index(drop=True)
+
+dates = df_sort["date"]
+
+if OOS_START_DATE not in set(dates):
+    raise ValueError(f"OOS_START_DATE {OOS_START_DATE} not found in data.")
+
+date_idx = df_sort[df_sort["date"] == OOS_START_DATE].index[0]
+
+
+# ==================================================
+# 6. Recursive OOS forecasting
+# ==================================================
+
+mode_name = "ensemble" if USE_ENSEMBLE else "single"
+
+for t in dates.iloc[date_idx:]:
+
+    if t > OOS_END_DATE:
+        continue
+
+    date_str = f"{t:.2f}".replace(".", "_")
+
+    result_file = (
+        f"{SAVE_DIR}/result_lstm_rnn_"
+        f"{mode_name}_"
+        f"h{H_DIM}_"
+        f"lookback{LOOKBACK}_"
+        f"mc{N_MC}_avg{N_AVG}_"
+        f"{date_str}.csv"
+    )
+
+    # 이미 저장된 날짜면 건너뛰기
+    if os.path.exists(result_file):
+        print("Already done, skip:", t)
+        continue
+
+    print("Forecasting date:", t)
+
+    train = df_sort[df_sort["date"] < t]
+    test = df_sort[df_sort["date"] == t]
+
+    if test.empty:
+        print("  No test observation for date:", t)
+        continue
+
+    # Skip if target is missing
+    if test[y_columns].isna().any(axis=None):
+        print("  Missing target for date, skip:", t)
+        continue
+
+    test_index = test.index[0]
+
+    # Build RNN training samples
+    X_past_train, X_current_train, y_train_seq, train_target_dates = make_rnn_train_samples(
+        data=train,
+        x_columns=x_columns,
+        y_columns=y_columns,
+        lookback=LOOKBACK
+    )
+
+    if len(y_train_seq) == 0:
+        print("  Not enough training sequences, skip:", t)
+        continue
+
+    # Build test sample
+    X_past_test, X_current_test = make_rnn_test_sample(
+        df_sort=df_sort,
+        test_index=test_index,
+        x_columns=x_columns,
+        lookback=LOOKBACK
+    )
+
+    y_test = test[y_columns]
+
+    # Historical mean benchmark:
+    # Use all available past realized returns before t, matching your static NN benchmark.
+    y_train_available = train[y_columns].dropna()
+    y_train_hist_mean = y_train_available.mean().values
+
+    # Scale X using train only
+    x_scaler = StandardScaler()
+    x_scaler.fit(train[x_columns])
+
+    X_past_train_scaled = scale_rnn_past_sequences(x_scaler, X_past_train)
+    X_past_test_scaled = scale_rnn_past_sequences(x_scaler, X_past_test)
+
+    X_current_train_scaled = x_scaler.transform(X_current_train)
+    X_current_test_scaled = x_scaler.transform(X_current_test)
+
+    # Scale Y using RNN training targets only
+    y_scaler = StandardScaler()
+    y_train_scaled = y_scaler.fit_transform(y_train_seq)
+
+    pred_candidates = []
+    val_loss_candidates = []
+    path_state_candidates = []
+
+    for seed in range(N_MC):
+        print("  RNN seed:", seed)
+
+        pred_scaled, val_loss, path_state = fit_one_rnn(
+            X_past_train_scaled=X_past_train_scaled,
+            X_current_train_scaled=X_current_train_scaled,
+            y_train_scaled=y_train_scaled,
+            X_past_test_scaled=X_past_test_scaled,
+            X_current_test_scaled=X_current_test_scaled,
+            seed=seed
+        )
+
+        pred_candidates.append(pred_scaled[0])
+        val_loss_candidates.append(val_loss)
+        path_state_candidates.append(path_state[0, 0])
+
+        print("    Validation loss:", val_loss)
+
+    pred_candidates = np.array(pred_candidates)
+    val_loss_candidates = np.array(val_loss_candidates)
+    path_state_candidates = np.array(path_state_candidates)
+
+    # Top N_AVG by validation loss
+    top_idx = np.argsort(val_loss_candidates)[:N_AVG]
+
+    print("  Top model indices:", top_idx)
+    print("  Top validation losses:", val_loss_candidates[top_idx])
+    print("  Best validation loss:", val_loss_candidates[top_idx[0]])
+
+    # Average selected predictions
+    pred_scaled_avg = pred_candidates[top_idx].mean(axis=0).reshape(1, -1)
+    path_state_avg = path_state_candidates[top_idx].mean()
+
+    # Back to original excess-return units
+    y_pred = y_scaler.inverse_transform(pred_scaled_avg)
+
+    # Save one-date result
+    one_result = pd.DataFrame({'date': [t]})
+
+    for i, y in enumerate(y_columns):
+        one_result[f'pred_{y}'] = y_pred[0, i]
+        one_result[f'true_{y}'] = y_test.iloc[0].values[i]
+        one_result[f'hist_{y}'] = y_train_hist_mean[i]
+
+    one_result["path_state"] = path_state_avg
+    one_result["N_MC"] = N_MC
+    one_result["N_AVG"] = N_AVG
+    one_result["LOOKBACK"] = LOOKBACK
+    one_result["H_DIM"] = H_DIM
+    one_result["N_LAYERS"] = N_LAYERS
+    one_result["mode"] = mode_name
+
+    one_result.to_csv(result_file, index=False)
+
+    print("Saved:", result_file)
+
+
+# ==================================================
+# 7. Load saved results
+# ==================================================
+
+pattern = (
+    f"{SAVE_DIR}/result_lstm_rnn_"
+    f"{mode_name}_"
+    f"h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_"
+    f"*.csv"
+)
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise ValueError("No saved result files found.")
+
+df_out = pd.concat(
+    [pd.read_csv(f) for f in files],
+    axis=0,
+    ignore_index=True
+)
+
+df_out = df_out.sort_values("date").reset_index(drop=True)
+
+# Evaluation period
+df_out_eval = df_out[
+    (df_out["date"] >= OOS_START_DATE)
+    & (df_out["date"] <= OOS_END_DATE)
+].copy()
+
+
+# ==================================================
+# 8. Compute R2 OOS and p-value
+# ==================================================
+
+r2_score_list = []
+p_value_list = []
+
+for y in y_columns:
+    r2_score = r2_oos(
+        df_out_eval[f'true_{y}'],
+        df_out_eval[f'pred_{y}'],
+        df_out_eval[f'hist_{y}']
+    )
+
+    p_value = rsz_signif(
+        df_out_eval[f'true_{y}'],
+        df_out_eval[f'pred_{y}'],
+        df_out_eval[f'hist_{y}']
+    )
+
+    r2_score_list.append(r2_score)
+    p_value_list.append(p_value)
+
+df_score = pd.DataFrame(
+    [r2_score_list, p_value_list],
+    index=['R2_oos', 'p_value'],
+    columns=y_columns
+)
+
+
+# ==================================================
+# 9. Save final results
+# ==================================================
+
+df_out.to_csv(
+    f"{SAVE_DIR}/lstm_rnn_{mode_name}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_mc{N_MC}_avg{N_AVG}_predictions_all.csv",
+    index=False
+)
+
+df_out_eval.to_csv(
+    f"{SAVE_DIR}/lstm_rnn_{mode_name}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_mc{N_MC}_avg{N_AVG}_predictions_eval.csv",
+    index=False
+)
+
+df_score.to_csv(
+    f"{SAVE_DIR}/lstm_rnn_{mode_name}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_mc{N_MC}_avg{N_AVG}_score_eval_to_{OOS_END_DATE}.csv",
+    index=True
+)
+
+print("Evaluation period:")
+print(df_out_eval["date"].min(), "to", df_out_eval["date"].max())
+
+print("RNN R2 OOS and p-values:")
+print(df_score)
