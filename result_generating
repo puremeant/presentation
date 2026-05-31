@@ -1,0 +1,309 @@
+```python
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 0. File paths: change these to your actual files
+# ==================================================
+
+# Static NN: x_t only
+STATIC_PRED_PATH = "./NN/nn_1layer_3nodes_mc100_avg10_predictions_eval.csv"
+
+# Lagged NN: stacked lagged inputs
+LAGGED_PRED_PATH = "./NN/lagged_nn_predictions_eval.csv"
+
+# RNN: historical path update
+RNN_PRED_PATH = "./RNN/lstm_rnn_single_h8_lookback12_mc1_avg1_predictions_eval.csv"
+
+
+# ==================================================
+# 1. Settings
+# ==================================================
+
+y_columns = ["xr24", "xr36", "xr48", "xr60", "xr84", "xr120"]
+maturity_latex = [
+    r"$xr^{(2)}$",
+    r"$xr^{(3)}$",
+    r"$xr^{(4)}$",
+    r"$xr^{(5)}$",
+    r"$xr^{(7)}$",
+    r"$xr^{(10)}$",
+]
+
+OOS_START_DATE = 1989.01
+OOS_END_DATE = 2017.12
+
+
+# ==================================================
+# 2. Evaluation functions
+# ==================================================
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = np.nansum((y_true - y_pred) ** 2)
+    denominator = np.nansum((y_true - y_hist_mean) ** 2)
+    return 1 - numerator / denominator
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    f = (
+        (y_true - y_hist_mean) ** 2
+        - (y_true - y_forecast) ** 2
+        + (y_hist_mean - y_forecast) ** 2
+    )
+
+    x = np.ones(np.shape(f))
+    model = sm.OLS(f, x, missing="drop", hasconst=True)
+    results = model.fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+
+    return 1 - tstat.cdf(results.tvalues[0], results.nobs - 1)
+
+
+def model_stats(df, y_columns):
+    r2_dict = {}
+    pval_dict = {}
+
+    for y in y_columns:
+        y_true = df[f"true_{y}"].to_numpy()
+        y_pred = df[f"pred_{y}"].to_numpy()
+        y_hist = df[f"hist_{y}"].to_numpy()
+
+        r2 = r2_oos(y_true, y_pred, y_hist)
+        pval = rsz_signif(y_true, y_pred, y_hist)
+
+        r2_dict[y] = r2
+        pval_dict[y] = pval
+
+    return r2_dict, pval_dict
+
+
+def incremental_r2(model_df, benchmark_df, y_columns):
+    """
+    Incremental R2:
+        1 - SSE_model / SSE_benchmark
+
+    This directly asks whether the RNN reduces forecast errors
+    relative to a benchmark model such as Static NN or Lagged NN.
+    """
+    inc = {}
+
+    merged = model_df.merge(
+        benchmark_df,
+        on="date",
+        suffixes=("_model", "_bench")
+    )
+
+    for y in y_columns:
+        true = merged[f"true_{y}_model"].to_numpy()
+        pred_model = merged[f"pred_{y}_model"].to_numpy()
+        pred_bench = merged[f"pred_{y}_bench"].to_numpy()
+
+        sse_model = np.nansum((true - pred_model) ** 2)
+        sse_bench = np.nansum((true - pred_bench) ** 2)
+
+        inc[y] = 1 - sse_model / sse_bench
+
+    return inc
+
+
+# ==================================================
+# 3. Formatting functions for LaTeX
+# ==================================================
+
+def fmt_pct(x):
+    return f"${100 * x:.1f}\\%$"
+
+
+def fmt_pval(r2, pval):
+    """
+    Following the style you used before:
+    report p-values only when R2 is positive.
+    """
+    if r2 <= 0 or pd.isna(pval):
+        return "--"
+    return f"${pval:.3f}$"
+
+
+def make_model_row(label, r2_dict, pval_dict):
+    r2_cells = [fmt_pct(r2_dict[y]) for y in y_columns]
+    p_cells = [fmt_pval(r2_dict[y], pval_dict[y]) for y in y_columns]
+
+    return label + "\n& " + " & ".join(r2_cells + p_cells) + r" \\"
+
+
+def make_inc_row(label, inc_dict):
+    r2_cells = [fmt_pct(inc_dict[y]) for y in y_columns]
+    p_cells = ["--" for _ in y_columns]
+
+    return label + "\n& " + " & ".join(r2_cells + p_cells) + r" \\"
+
+
+# ==================================================
+# 4. Load and clean prediction files
+# ==================================================
+
+static_df = pd.read_csv(STATIC_PRED_PATH)
+lagged_df = pd.read_csv(LAGGED_PRED_PATH)
+rnn_df = pd.read_csv(RNN_PRED_PATH)
+
+for df in [static_df, lagged_df, rnn_df]:
+    df["date"] = df["date"].round(2)
+    df.drop_duplicates(subset=["date"], keep="last", inplace=True)
+    df.sort_values("date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+static_df = static_df[
+    (static_df["date"] >= OOS_START_DATE) & (static_df["date"] <= OOS_END_DATE)
+].copy()
+
+lagged_df = lagged_df[
+    (lagged_df["date"] >= OOS_START_DATE) & (lagged_df["date"] <= OOS_END_DATE)
+].copy()
+
+rnn_df = rnn_df[
+    (rnn_df["date"] >= OOS_START_DATE) & (rnn_df["date"] <= OOS_END_DATE)
+].copy()
+
+
+# Keep only common evaluation dates across all three models
+common_dates = sorted(
+    set(static_df["date"])
+    .intersection(set(lagged_df["date"]))
+    .intersection(set(rnn_df["date"]))
+)
+
+static_df = static_df[static_df["date"].isin(common_dates)].copy()
+lagged_df = lagged_df[lagged_df["date"].isin(common_dates)].copy()
+rnn_df = rnn_df[rnn_df["date"].isin(common_dates)].copy()
+
+print("Common evaluation period:")
+print(min(common_dates), "to", max(common_dates))
+print("Number of OOS months:", len(common_dates))
+
+
+# ==================================================
+# 5. Compute statistics
+# ==================================================
+
+static_r2, static_p = model_stats(static_df, y_columns)
+lagged_r2, lagged_p = model_stats(lagged_df, y_columns)
+rnn_r2, rnn_p = model_stats(rnn_df, y_columns)
+
+rnn_vs_static = incremental_r2(rnn_df, static_df, y_columns)
+rnn_vs_lagged = incremental_r2(rnn_df, lagged_df, y_columns)
+
+
+# ==================================================
+# 6. Create LaTeX rows
+# ==================================================
+
+row_static = make_model_row(
+    r"Static NN: current state $\mathbf{x}_t$",
+    static_r2,
+    static_p
+)
+
+row_lagged = make_model_row(
+    r"Lagged NN: stacked inputs $[\mathbf{x}_t,\mathbf{x}_{t-1},\ldots,\mathbf{x}_{t-11}]$",
+    lagged_r2,
+    lagged_p
+)
+
+row_rnn = make_model_row(
+    r"\textbf{RNN: recurrent path update}",
+    rnn_r2,
+    rnn_p
+)
+
+row_inc_static = make_inc_row(
+    r"RNN vs. Static NN",
+    rnn_vs_static
+)
+
+row_inc_lagged = make_inc_row(
+    r"RNN vs. Lagged NN",
+    rnn_vs_lagged
+)
+
+
+# ==================================================
+# 7. Print full Beamer frame
+# ==================================================
+
+latex_frame = rf"""
+%------------------------------------------------
+\begin{{frame}}
+\frametitle{{Results: Forecasting Performance}}
+
+\scriptsize
+\setlength{{\tabcolsep}}{{2.6pt}}
+\renewcommand{{\arraystretch}}{{0.88}}
+
+\vspace{{0.03cm}}
+
+\begin{{center}}
+\begin{{adjustbox}}{{max totalsize={{\textwidth}}{{0.80\textheight}},center}}
+\begin{{tabular}}{{lcccccc|cccccc}}
+\hline
+ & \multicolumn{{6}}{{c|}}{{$R^2_{{\mathrm{{OOS}}}}$}} 
+ & \multicolumn{{6}}{{c}}{{$p$-value}} \\
+\cline{{2-13}}
+Models 
+& {maturity_latex[0]} 
+& {maturity_latex[1]} 
+& {maturity_latex[2]} 
+& {maturity_latex[3]} 
+& {maturity_latex[4]} 
+& {maturity_latex[5]}
+& {maturity_latex[0]} 
+& {maturity_latex[1]} 
+& {maturity_latex[2]} 
+& {maturity_latex[3]} 
+& {maturity_latex[4]} 
+& {maturity_latex[5]} \\
+\hline
+
+\multicolumn{{13}}{{l}}{{\textit{{Panel A: Standard $R^2_{{\mathrm{{OOS}}}}$ relative to historical mean}}}} \\
+\hline
+{row_static}
+
+{row_lagged}
+
+{row_rnn}
+
+\hline
+\multicolumn{{13}}{{l}}{{\textit{{Panel B: Incremental $R^2_{{\mathrm{{OOS}}}}$ of the RNN}}}} \\
+\hline
+{row_inc_static}
+
+{row_inc_lagged}
+
+\hline
+\end{{tabular}}
+\end{{adjustbox}}
+\end{{center}}
+
+\vspace{{-0.10cm}}
+
+\fontsize{{6}}{{6}}\selectfont
+Note: Panel A reports $R^2_{{\mathrm{{OOS}}}}$ relative to the recursively updated historical-mean forecast. 
+Following Bianchi et al. (2021), $p$-values are reported only when $R^2_{{\mathrm{{OOS}}}}>0$. 
+Panel B reports incremental $R^2_{{\mathrm{{OOS}}}}$ using the indicated model as the benchmark.
+Positive values in Panel B indicate that the RNN reduces forecast errors relative to the benchmark.
+
+\vspace{{0.05cm}}
+
+\begin{{itemize}}
+    \item Static NN uses only the current yield-curve state $\mathbf{{x}}_t$.
+    \item Lagged NN stacks past yield-curve states as a high-dimensional static input.
+    \item RNN summarizes the ordered path through recurrent updating and combines it with $\mathbf{{x}}_t$.
+\end{{itemize}}
+
+\end{{frame}}
+%------------------------------------------------
+"""
+
+print(latex_frame)
+```
