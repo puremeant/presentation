@@ -1,0 +1,455 @@
+##### Neural Network: 1 hidden layer, yield-only, author-style ensemble #####
+##### PyCharm main version / Colab lines are commented #####
+
+# ---------------------------------------------------------
+1. OOS 시작점 맞게 반영
+2. Expanding-window OOS 구조
+3. 오로지 forward rate = X, yield = y. 저자는 X에 macro variable 추가
+4. multi-output forecasting: xr 전체 6개 넣고 돌리기
+5. NN ensemble : 저자는 nMC = 100, nAvg = 10, 같은 모델을 여러 seed로 학습한 뒤 validation loss가 낮은 상위 nAvg개의 예측을 평균. 
+N_MC, N_AVG를 두고 seed별 prediction과 validation loss를 저장한 뒤 np.argsort(val_loss_candidates)[:N_AVG]로 top model을 골라 평균
+6. hyperparameter 후보
+7. early stopping, validation split: EarlyStopping(monitor='val_loss', min_delta=1e-6, patience=20)와 validation_split=0.15, batch_size=32, shuffle=True를 사용
+8. optimizer : 저자 NN 함수는 SGD with momentum/nesterov를 사용. 네 코드도 keras.optimizers.SGD(learning_rate=0.01, momentum=0.9, nesterov=True)
+9. HyperFreq : 첫 OOS 시점과 48개월마다 fresh hyperparameter search
+10. R2, p-value : 개념적으로는 맞지만, 저자 코드와 완전히 같은 방식은 아님 (history_mean)
+# -----------------------------------------------------------
+
+
+import os
+import gc
+import glob
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers, regularizers
+
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 0. Settings
+# ==================================================
+
+# ---------- PyCharm version ----------
+SAVE_DIR = './NN'
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# ---------- Colab version ----------
+# from google.colab import drive
+# drive.mount('/content/drive')
+# SAVE_DIR = '/content/drive/MyDrive/AP/Paper/bond_nn_results'
+# os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# 테스트용
+N_MC = 2
+N_AVG = 1
+
+# 저자 스타일 최종 버전
+# N_MC = 100
+# N_AVG = 10
+
+HYPER_FREQ = 4 * 12
+
+NN_PARAMS = {
+    'Dropout': [0.1, 0.3, 0.5],
+    'l1l2': [0.01, 0.001]
+}
+
+# NN - 1 layer, 3 nodes
+hidden_nodes = 3
+
+# NN - 1 layer, 7 nodes로 돌리고 싶으면 위 줄 대신 아래 줄 사용
+# hidden_nodes = 7
+
+
+# ==================================================
+# 1. OOS R2 and p-value functions
+# ==================================================
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    numerator = ((y_true - y_pred) ** 2).sum()
+    denominator = ((y_true - y_hist_mean) ** 2).sum()
+    return 1 - (numerator / denominator)
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    f = ((y_true - y_hist_mean) ** 2
+         - (y_true - y_forecast) ** 2
+         + (y_hist_mean - y_forecast) ** 2)
+
+    x = np.ones(np.shape(f))
+
+    model = sm.OLS(f, x, missing='drop', hasconst=True)
+    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+
+    return 1 - tstat.cdf(results.tvalues[0], results.nobs - 1)
+
+
+# ==================================================
+# 2. Build NN
+# ==================================================
+
+def build_nn(input_dim, hidden_nodes, output_dim, dropout_rate, penalty, seed):
+    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)
+
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+
+        layers.Dropout(dropout_rate),
+
+        layers.Dense(
+            hidden_nodes,
+            activation='relu',
+            kernel_initializer='he_normal',
+            bias_initializer='he_normal',
+            kernel_regularizer=regularizers.l1_l2(l1=penalty, l2=penalty)
+        ),
+
+        layers.Dense(
+            output_dim,
+            activation='linear',
+            kernel_initializer='he_normal',
+            bias_initializer='he_normal'
+        )
+    ])
+
+    lr_schedule = keras.optimizers.schedules.InverseTimeDecay(
+        initial_learning_rate=0.01,
+        decay_steps=1,
+        decay_rate=0.01
+    )
+
+    optimizer = keras.optimizers.SGD(
+        learning_rate=lr_schedule,
+        momentum=0.9,
+        nesterov=True
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss='mse'
+    )
+
+    return model
+
+
+# ==================================================
+# 3. Fit one NN with given hyperparameters
+# ==================================================
+
+def fit_one_nn(x_train_scaled, y_train_scaled, x_test_scaled,
+               hidden_nodes, seed, dropout_rate, penalty):
+
+    keras.backend.clear_session()
+
+    nn_model = build_nn(
+        input_dim=x_train_scaled.shape[1],
+        hidden_nodes=hidden_nodes,
+        output_dim=y_train_scaled.shape[1],
+        dropout_rate=dropout_rate,
+        penalty=penalty,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        min_delta=1e-6,
+        patience=20,
+        verbose=0,
+        mode='auto',
+        restore_best_weights=True
+    )
+
+    history = nn_model.fit(
+        x_train_scaled,
+        y_train_scaled,
+        epochs=20,        # 테스트용. 최종은 500으로 변경.
+        batch_size=32,
+        validation_split=0.15,
+        shuffle=True,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    val_loss = min(history.history['val_loss'])
+    pred_scaled = nn_model.predict(x_test_scaled, verbose=0)
+
+    del nn_model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return pred_scaled, val_loss
+
+
+# ==================================================
+# 4. Hyperparameter search for one seed
+# ==================================================
+
+def grid_search_one_seed(x_train_scaled, y_train_scaled, x_test_scaled,
+                         hidden_nodes, seed):
+
+    best_val_loss = np.inf
+    best_pred_scaled = None
+    best_dropout = None
+    best_penalty = None
+
+    for dropout_rate in NN_PARAMS['Dropout']:
+        for penalty in NN_PARAMS['l1l2']:
+
+            pred_scaled, val_loss = fit_one_nn(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
+                hidden_nodes=hidden_nodes,
+                seed=seed,
+                dropout_rate=dropout_rate,
+                penalty=penalty
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_pred_scaled = pred_scaled
+                best_dropout = dropout_rate
+                best_penalty = penalty
+
+    return best_pred_scaled, best_val_loss, best_dropout, best_penalty
+
+
+# ==================================================
+# 5. Load data
+# ==================================================
+
+# ---------- PyCharm version ----------
+df = pd.read_csv('../DATA/data_soo.csv')
+
+# ---------- Colab version ----------
+# file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+# url = f"https://drive.google.com/uc?id={file_id}"
+# df = pd.read_csv(url)
+
+
+x_columns = ['0f1', '1f1', '2f1', '3f1', '4f1',
+             '5f1', '6f1', '7f1', '8f1', '9f1']
+
+y_columns = ['xr24', 'xr36', 'xr48', 'xr60', 'xr84', 'xr120']
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+dates = df_sort["date"]
+date_idx = df_sort[df_sort["date"] == 1989.01].index[0]
+
+
+# ==================================================
+# 6. Recursive OOS forecasting
+# ==================================================
+
+# seed별로 마지막 선택된 hyperparameter 저장
+saved_dropout = {}
+saved_penalty = {}
+
+for step_no, t in enumerate(dates.iloc[date_idx:], start=1):
+
+    date_str = f"{t:.2f}".replace(".", "_")
+
+    result_file = (
+        f"{SAVE_DIR}/result_"
+        f"{hidden_nodes}nodes_"
+        f"mc{N_MC}_avg{N_AVG}_"
+        f"{date_str}.csv"
+    )
+
+    # 이미 저장된 날짜면 건너뛰기
+    if os.path.exists(result_file):
+        print("Already done, skip:", t)
+        continue
+
+    print("Forecasting date:", t)
+
+    # 저자식: 첫 번째 OOS date 또는 48개월마다 hyperparameter search
+    if (step_no == 1) or (step_no % HYPER_FREQ == 0):
+        refit = True
+    else:
+        refit = False
+
+    print("  Refit hyperparameters:", refit)
+
+    train = df_sort[df_sort["date"] < t]
+    test = df_sort[df_sort["date"] == t]
+
+    x_train = train[x_columns]
+    y_train = train[y_columns]
+
+    x_test = test[x_columns]
+    y_test = test[y_columns]
+
+    y_train_hist_mean = y_train.mean().values
+
+    # Scale X using train only
+    x_scaler = StandardScaler()
+    x_train_scaled = x_scaler.fit_transform(x_train)
+    x_test_scaled = x_scaler.transform(x_test)
+
+    # Scale Y using train only
+    y_scaler = StandardScaler()
+    y_train_scaled = y_scaler.fit_transform(y_train)
+
+    pred_candidates = []
+    val_loss_candidates = []
+
+    for seed in range(N_MC):
+        print("  NN seed:", seed)
+
+        if refit or (seed not in saved_dropout):
+
+            pred_scaled, val_loss, best_dropout, best_penalty = grid_search_one_seed(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
+                hidden_nodes=hidden_nodes,
+                seed=seed
+            )
+
+            saved_dropout[seed] = best_dropout
+            saved_penalty[seed] = best_penalty
+
+            print("    Best params:",
+                  "dropout =", best_dropout,
+                  "penalty =", best_penalty)
+
+        else:
+            best_dropout = saved_dropout[seed]
+            best_penalty = saved_penalty[seed]
+
+            pred_scaled, val_loss = fit_one_nn(
+                x_train_scaled=x_train_scaled,
+                y_train_scaled=y_train_scaled,
+                x_test_scaled=x_test_scaled,
+                hidden_nodes=hidden_nodes,
+                seed=seed,
+                dropout_rate=best_dropout,
+                penalty=best_penalty
+            )
+
+            print("    Reused params:",
+                  "dropout =", best_dropout,
+                  "penalty =", best_penalty)
+
+        pred_candidates.append(pred_scaled[0])
+        val_loss_candidates.append(val_loss)
+
+    pred_candidates = np.array(pred_candidates)
+    val_loss_candidates = np.array(val_loss_candidates)
+
+    # validation loss가 낮은 top N_AVG개 고르기
+    top_idx = np.argsort(val_loss_candidates)[:N_AVG]
+
+    print("  Top model indices:", top_idx)
+    print("  Top validation losses:", val_loss_candidates[top_idx])
+    print("  Best validation loss:", val_loss_candidates[top_idx[0]])
+
+    # top models의 scaled prediction 평균
+    pred_scaled_avg = pred_candidates[top_idx].mean(axis=0).reshape(1, -1)
+
+    # 원래 excess return 단위로 되돌리기
+    y_pred = y_scaler.inverse_transform(pred_scaled_avg)
+
+    # 이 날짜 결과만 저장
+    one_result = pd.DataFrame({'date': [t]})
+
+    for i, y in enumerate(y_columns):
+        one_result[f'pred_{y}'] = y_pred[0, i]
+        one_result[f'true_{y}'] = y_test.iloc[0].values[i]
+        one_result[f'hist_{y}'] = y_train_hist_mean[i]
+
+    one_result.to_csv(result_file, index=False)
+
+    print("Saved:", result_file)
+
+
+# ==================================================
+# 7. Load saved results
+# ==================================================
+
+pattern = (
+    f"{SAVE_DIR}/result_"
+    f"{hidden_nodes}nodes_"
+    f"mc{N_MC}_avg{N_AVG}_"
+    f"*.csv"
+)
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise ValueError("No saved result files found.")
+
+df_out = pd.concat(
+    [pd.read_csv(f) for f in files],
+    axis=0,
+    ignore_index=True
+)
+
+df_out = df_out.sort_values("date").reset_index(drop=True)
+
+
+## 네가 논문 sample을 “realized return이 2018.12까지”라고 맞추고 싶다면, 마지막 predictor date는 보통 2017.12가 맞아. 
+왜냐하면 row 2017.12의 xr는 2017.12 → 2018.12 1년 보유 초과수익률이고, row 2018.12의 xr는 2018.12 → 2019.12가 필요.
+# ==================================================
+# 8. Compute R2 OOS and p-value
+#    Use only predictor dates whose 1-year-ahead returns end by 2018.12
+# ==================================================
+
+df_out_eval = df_out[df_out["date"] <= 2017.12].copy()
+
+r2_score_list = []
+p_value_list = []
+
+for y in y_columns:
+    r2_score = r2_oos(
+        df_out_eval[f'true_{y}'],
+        df_out_eval[f'pred_{y}'],
+        df_out_eval[f'hist_{y}']
+    )
+
+    p_value = rsz_signif(
+        df_out_eval[f'true_{y}'],
+        df_out_eval[f'pred_{y}'],
+        df_out_eval[f'hist_{y}']
+    )
+
+    r2_score_list.append(r2_score)
+    p_value_list.append(p_value)
+
+df_score = pd.DataFrame(
+    [r2_score_list, p_value_list],
+    index=['R2_oos', 'p_value'],
+    columns=y_columns
+)
+
+print("Evaluation period:")
+print(df_out_eval["date"].min(), "to", df_out_eval["date"].max())
+print(df_score)
+
+
+# ==================================================
+# 9. Save final results
+# ==================================================
+
+df_out.to_csv(
+    f"{SAVE_DIR}/nn_1layer_{hidden_nodes}nodes_mc{N_MC}_avg{N_AVG}_predictions_to_2017_12.csv",
+    index=False
+)
+
+df_score.to_csv(
+    f"{SAVE_DIR}/nn_1layer_{hidden_nodes}nodes_mc{N_MC}_avg{N_AVG}_score_to_2017_12.csv",
+    index=True
+)
+
+print("R2 OOS and p-values:")
+print(df_score)
