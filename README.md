@@ -16,6 +16,14 @@ single model (learning_rate=0.001, batch_size=32, validation_split=0.15, loss='m
        xr24      xr36      xr48      xr60      xr84     xr120
 0 -0.870831 -0.818162 -0.849705 -0.837254 -0.810891 -0.803931
 
+# RNN single model
+Evaluation period:
+1989.01 to 2017.12
+RNN R2 OOS and p-values:
+             xr24      xr36      xr48      xr60      xr84     xr120
+R2_oos  -0.493051 -0.022169 -0.631803 -0.441402 -0.007905 -0.017854
+p_value  0.254758  0.185019  0.455862  0.187624  0.165251  0.128362
+
 # script
 The original paper uses high-performance computing and parallelizes the estimation of the **100 neural networks** at each forecast date and uses model averaging to reduce sensitivity to random initialization. In my extension, I first replicate this forecasting design to report **simpler single-model results as a robustness check**. **A naive single feedforward NN without model averaging performs poorly.** This is why the original paper relies on regularization, validation-based selection, and forecast averaging. Averaging the top-performing networks is a reasonable ensemble strategy, but it may also introduce validation-selection risk. 
 Because fully flexible deep architectures are computationally expensive and may overfit, my extension focuses not on making the static network deeper, but on changing the information structure: I allow the model to use historical yield-curve paths through an RNN.
