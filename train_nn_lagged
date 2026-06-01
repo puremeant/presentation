@@ -23,20 +23,20 @@ from scipy.stats import t as tstat
 # ==================================================
 
 # ---------- PyCharm version ----------
-SAVE_DIR = "./LAGGED_NN"
-os.makedirs(SAVE_DIR, exist_ok=True)
+# SAVE_DIR = "./LAGGED_NN"
+# os.makedirs(SAVE_DIR, exist_ok=True)
 
-DATA_PATH = "../DATA/data_soo.csv"
+#DATA_PATH = "../DATA/data_soo.csv"
 
 
 # ---------- Colab version ----------
-# from google.colab import drive
-# drive.mount('/content/drive')
-# SAVE_DIR = "/content/drive/MyDrive/AP/Paper/lagged_nn_results"
-# os.makedirs(SAVE_DIR, exist_ok=True)
-#
-# file_id = "YOUR_DATA_SOO_FILE_ID"
-# DATA_PATH = f"https://drive.google.com/uc?id={file_id}"
+from google.colab import drive
+drive.mount('/content/drive')
+SAVE_DIR = "/content/drive/MyDrive/AP/Paper/lagged_nn_results"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+file_id = "YOUR_DATA_SOO_FILE_ID"
+DATA_PATH = f"https://drive.google.com/uc?id={file_id}"
 
 
 # ==================================================
@@ -48,12 +48,12 @@ USE_ENSEMBLE = False
 
 if USE_ENSEMBLE:
     # Light ensemble
-    N_MC = 20
-    N_AVG = 5
+    # N_MC = 20
+    # N_AVG = 5
 
     # Author-style heavier option
-    # N_MC = 100
-    # N_AVG = 10
+    N_MC = 100
+    N_AVG = 10
 else:
     N_MC = 1
     N_AVG = 1
@@ -62,14 +62,14 @@ else:
 # Lag window
 LOOKBACK = 12
 
-# If True:
-#   input = [x_t, x_{t-1}, ..., x_{t-11}]
-# If False:
-#   input = [x_{t-12}, ..., x_{t-1}]
-#
+If True:
+   input = [x_t, x_{t-1}, ..., x_{t-11}]
+If False:
+   input = [x_{t-12}, ..., x_{t-1}]
+
 # For direct comparison with RNN path model, False is cleaner.
 # For comparison with static NN + lagged current-state control, True can be useful.
-INCLUDE_CURRENT_X = False
+INCLUDE_CURRENT_X = True
 
 
 OOS_START_DATE = 1989.01
