@@ -24,12 +24,10 @@ RNN R2 OOS and p-values:
 R2_oos  -0.493051 -0.022169 -0.631803 -0.441402 -0.007905 -0.017854
 p_value  0.254758  0.185019  0.455862  0.187624  0.165251  0.128362
 
-# RNN single model_
+# RNN single model_ with different options
 N_LAYERS = 1
 H_DIM = 8
 DENSE_DIM = 8
-EPOCHS = 200
-LR = 0.001
 EPOCHS = 200
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
@@ -43,6 +41,26 @@ State-Transition RNN R2 OOS and p-values:
              xr24      xr36      xr48      xr60      xr84     xr120
 R2_oos  -0.118760 -0.021507  0.009176 -0.248741 -0.244068 -0.110062
 p_value  0.569027  0.175263  0.071413  0.773455  0.580654  0.335716
+
+
+N_LAYERS = 2
+H_DIM = 64
+DENSE_DIM = 64
+EPOCHS = 500
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+PATIENCE = 100
+VALIDATION_SPLIT = 0.15
+STATE_LOSS_WEIGHT = 0.2
+XR_LOSS_WEIGHT = 1.0
+USE_CURRENT_X_IN_XR_HEAD = False
+USE_ENSEMBLE = False
+valuation period:
+1989.01 to 2017.12
+State-Transition RNN R2 OOS and p-values:
+             xr24      xr36      xr48      xr60      xr84     xr120
+R2_oos  -0.221509 -0.556610 -0.164154 -0.208679  0.131359 -0.389339
+p_value  0.252565  0.651886  0.237164  0.379791  0.011451  0.891654
 
 
 # script
