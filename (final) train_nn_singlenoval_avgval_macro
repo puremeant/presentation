@@ -1,0 +1,618 @@
+##### Macro Static Neural Network #####
+##### data_soo_fredmd_2019_12_balanced.csv version #####
+##### Forecast equation: xr_t = g(x_t, m_t) #####
+##### Two settings:
+##### (1) single_no_val: single model, no validation
+##### (2) avg_val: validation-based model averaging
+
+
+# ==================================================
+# 0. Imports
+# ==================================================
+
+import os
+import gc
+import glob
+import random
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers, regularizers
+
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 1. Colab settings
+# ==================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+SAVE_DIR = "/content/drive/MyDrive/AP/Paper/nn_macro_results"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Option A: If you upload the balanced macro file to Google Drive, use this path.
+DATA_PATH = "/content/drive/MyDrive/AP/Paper/macro_data/data_soo_fredmd_2019_12_balanced.csv"
+
+# Option B: If you uploaded the file directly to Colab session, use:
+# DATA_PATH = "/content/data_soo_fredmd_2019_12_balanced.csv"
+
+
+# ==================================================
+# 2. Choose experiment setting
+# ==================================================
+
+# Choose one:
+# RUN_SETTING = "single_no_val"
+RUN_SETTING = "avg_val"
+
+
+if RUN_SETTING == "single_no_val":
+    USE_ENSEMBLE = False
+    N_MC = 1
+    N_AVG = 1
+    VALIDATION_SPLIT = 0.0
+    EARLY_STOP_MONITOR = "loss"
+
+elif RUN_SETTING == "avg_val":
+    USE_ENSEMBLE = True
+    N_MC = 20
+    N_AVG = 5
+    VALIDATION_SPLIT = 0.15
+    EARLY_STOP_MONITOR = "val_loss"
+
+else:
+    raise ValueError("RUN_SETTING must be either 'single_no_val' or 'avg_val'.")
+
+
+# ==================================================
+# 3. Forecast and model settings
+# ==================================================
+
+OOS_START_DATE = 1989.01
+OOS_END_DATE = 2017.12
+
+# NN architecture
+N_HIDDEN_LAYERS = 1
+HIDDEN_NODES = 7
+ACTIVATION = "relu"
+
+# Training
+EPOCHS = 500
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+PATIENCE = 20
+
+# Regularization grid
+NN_PARAMS = {
+    "Dropout": [0.1, 0.3, 0.5],
+    "l1l2": [0.01, 0.001]
+}
+
+
+# ==================================================
+# 4. Columns
+# ==================================================
+
+x_columns = [
+    "0f1", "1f1", "2f1", "3f1", "4f1",
+    "5f1", "6f1", "7f1", "8f1", "9f1"
+]
+
+y_columns = [
+    "xr24", "xr36", "xr48", "xr60", "xr84", "xr120"
+]
+
+
+# ==================================================
+# 5. Helper functions
+# ==================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)
+
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    numerator = np.nansum((y_true - y_pred) ** 2)
+    denominator = np.nansum((y_true - y_hist_mean) ** 2)
+
+    if denominator == 0:
+        return np.nan
+
+    return 1 - numerator / denominator
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_forecast = np.asarray(y_forecast).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    f = (
+        (y_true - y_hist_mean) ** 2
+        - (y_true - y_forecast) ** 2
+        + (y_hist_mean - y_forecast) ** 2
+    )
+
+    x = np.ones(len(f))
+
+    model = sm.OLS(f, x, missing="drop", hasconst=True)
+    results = model.fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+
+    t_value = np.asarray(results.tvalues).ravel()[0]
+
+    return 1 - tstat.cdf(t_value, results.nobs - 1)
+
+
+# ==================================================
+# 6. Build Macro Static NN
+# ==================================================
+
+def build_macro_nn(
+    input_dim,
+    y_dim,
+    hidden_nodes,
+    n_hidden_layers,
+    activation,
+    learning_rate,
+    dropout_rate,
+    penalty,
+    seed
+):
+    set_seed(seed)
+
+    model = keras.Sequential(name="macro_static_nn")
+
+    model.add(layers.Input(shape=(input_dim,)))
+
+    model.add(layers.Dropout(dropout_rate))
+
+    for layer_id in range(n_hidden_layers):
+        model.add(
+            layers.Dense(
+                hidden_nodes,
+                activation=activation,
+                kernel_initializer="he_normal",
+                bias_initializer="he_normal",
+                kernel_regularizer=regularizers.l1_l2(l1=penalty, l2=penalty),
+                name=f"hidden_{layer_id + 1}"
+            )
+        )
+
+    model.add(
+        layers.Dense(
+            y_dim,
+            activation="linear",
+            kernel_initializer="he_normal",
+            bias_initializer="he_normal",
+            name="output"
+        )
+    )
+
+    lr_schedule = keras.optimizers.schedules.InverseTimeDecay(
+        initial_learning_rate=0.01,
+        decay_steps=1,
+        decay_rate=0.01
+    )
+
+    optimizer = keras.optimizers.SGD(
+        learning_rate=lr_schedule,
+        momentum=0.9,
+        nesterov=True
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss="mse"
+    )
+
+    return model
+
+
+# ==================================================
+# 7. Fit one NN
+# ==================================================
+
+def fit_one_macro_nn(
+    X_train_scaled,
+    Y_train_scaled,
+    X_test_scaled,
+    seed,
+    dropout_rate,
+    penalty
+):
+    keras.backend.clear_session()
+
+    model = build_macro_nn(
+        input_dim=X_train_scaled.shape[1],
+        y_dim=Y_train_scaled.shape[1],
+        hidden_nodes=HIDDEN_NODES,
+        n_hidden_layers=N_HIDDEN_LAYERS,
+        activation=ACTIVATION,
+        learning_rate=LEARNING_RATE,
+        dropout_rate=dropout_rate,
+        penalty=penalty,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor=EARLY_STOP_MONITOR,
+        min_delta=1e-6,
+        patience=PATIENCE,
+        verbose=0,
+        mode="auto",
+        restore_best_weights=True
+    )
+
+    history = model.fit(
+        X_train_scaled,
+        Y_train_scaled,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=VALIDATION_SPLIT,
+        shuffle=True,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    model_loss = min(history.history[EARLY_STOP_MONITOR])
+
+    pred_scaled = model.predict(X_test_scaled, verbose=0)
+
+    del model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return pred_scaled, model_loss
+
+
+# ==================================================
+# 8. Hyperparameter search for one seed
+# ==================================================
+
+def grid_search_one_seed(
+    X_train_scaled,
+    Y_train_scaled,
+    X_test_scaled,
+    seed
+):
+    best_model_loss = np.inf
+    best_pred_scaled = None
+    best_dropout = None
+    best_penalty = None
+
+    for dropout_rate in NN_PARAMS["Dropout"]:
+        for penalty in NN_PARAMS["l1l2"]:
+
+            pred_scaled, model_loss = fit_one_macro_nn(
+                X_train_scaled=X_train_scaled,
+                Y_train_scaled=Y_train_scaled,
+                X_test_scaled=X_test_scaled,
+                seed=seed,
+                dropout_rate=dropout_rate,
+                penalty=penalty
+            )
+
+            if model_loss < best_model_loss:
+                best_model_loss = model_loss
+                best_pred_scaled = pred_scaled
+                best_dropout = dropout_rate
+                best_penalty = penalty
+
+    return best_pred_scaled, best_model_loss, best_dropout, best_penalty
+
+
+# ==================================================
+# 9. Load data
+# ==================================================
+
+df = pd.read_csv(DATA_PATH)
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+required_base_cols = ["date"] + x_columns + y_columns
+missing_base_cols = [c for c in required_base_cols if c not in df_sort.columns]
+
+if len(missing_base_cols) > 0:
+    raise ValueError(f"Missing required columns in macro data: {missing_base_cols}")
+
+# Macro columns are everything except date, yield predictors, and excess-return targets
+macro_columns = [
+    c for c in df_sort.columns
+    if c not in ["date"] + x_columns + y_columns
+]
+
+if len(macro_columns) == 0:
+    raise ValueError("No macro columns found. Check data_soo_fredmd_2019_12_balanced.csv.")
+
+# Macro static NN input: [x_t, m_t]
+predictor_columns = x_columns + macro_columns
+
+# Keep rows where predictors exist
+df_sort = df_sort.dropna(subset=predictor_columns).reset_index(drop=True)
+
+dates = df_sort["date"]
+
+if OOS_START_DATE not in set(dates):
+    raise ValueError(f"OOS_START_DATE {OOS_START_DATE} not found in data.")
+
+date_idx = df_sort[df_sort["date"] == OOS_START_DATE].index[0]
+
+print("Data loaded.")
+print("Date range:", df_sort["date"].min(), "to", df_sort["date"].max())
+print("Number of yield predictors:", len(x_columns))
+print("Number of macro predictors:", len(macro_columns))
+print("Total input dimension:", len(predictor_columns))
+print("RUN_SETTING:", RUN_SETTING)
+print("N_MC:", N_MC, "N_AVG:", N_AVG)
+print("VALIDATION_SPLIT:", VALIDATION_SPLIT)
+print("EARLY_STOP_MONITOR:", EARLY_STOP_MONITOR)
+
+
+# ==================================================
+# 10. Recursive OOS forecasting
+# ==================================================
+
+mode_name = "single_no_val" if RUN_SETTING == "single_no_val" else "avg_val"
+model_name = "macro_static_nn"
+
+saved_dropout = {}
+saved_penalty = {}
+
+for t in dates.iloc[date_idx:]:
+
+    if t > OOS_END_DATE:
+        break
+
+    date_str = f"{t:.2f}".replace(".", "_")
+
+    result_file = (
+        f"{SAVE_DIR}/result_{model_name}_"
+        f"{mode_name}_"
+        f"{N_HIDDEN_LAYERS}layer_"
+        f"{HIDDEN_NODES}nodes_"
+        f"mc{N_MC}_avg{N_AVG}_"
+        f"{date_str}.csv"
+    )
+
+    if os.path.exists(result_file):
+        print("Already done, skip:", t)
+        continue
+
+    print("Forecasting date:", t)
+
+    train = df_sort[df_sort["date"] < t].copy()
+    test = df_sort[df_sort["date"] == t].copy()
+
+    if test.empty:
+        print("  No test observation for date:", t)
+        continue
+
+    if test[y_columns].isna().any(axis=None):
+        print("  Missing target for date, skip:", t)
+        continue
+
+    # Drop rows with missing Y in training sample
+    y_train = train[y_columns].dropna()
+    valid_train_index = y_train.index
+
+    X_train = train.loc[valid_train_index, predictor_columns]
+    Y_train = y_train
+
+    X_test = test[predictor_columns]
+    y_test = test[y_columns]
+
+    if X_train.isna().any().any():
+        print("  Missing predictor values in train, skip:", t)
+        continue
+
+    if X_test.isna().any().any():
+        print("  Missing predictor values in test, skip:", t)
+        continue
+
+    if len(Y_train) == 0:
+        print("  Not enough training observations, skip:", t)
+        continue
+
+    # Historical mean benchmark
+    hist_mean = Y_train.mean().values
+
+    # Scale X using train only
+    x_scaler = StandardScaler()
+    X_train_scaled = x_scaler.fit_transform(X_train)
+    X_test_scaled = x_scaler.transform(X_test)
+
+    # Scale Y using train only
+    y_scaler = StandardScaler()
+    Y_train_scaled = y_scaler.fit_transform(Y_train)
+
+    pred_candidates = []
+    loss_candidates = []
+    dropout_candidates = []
+    penalty_candidates = []
+
+    for seed in range(N_MC):
+        print("  Macro NN seed:", seed)
+
+        pred_scaled, model_loss, best_dropout, best_penalty = grid_search_one_seed(
+            X_train_scaled=X_train_scaled,
+            Y_train_scaled=Y_train_scaled,
+            X_test_scaled=X_test_scaled,
+            seed=seed
+        )
+
+        pred_candidates.append(pred_scaled[0])
+        loss_candidates.append(model_loss)
+        dropout_candidates.append(best_dropout)
+        penalty_candidates.append(best_penalty)
+
+        print(
+            f"    {EARLY_STOP_MONITOR}:",
+            model_loss,
+            "| dropout:",
+            best_dropout,
+            "| penalty:",
+            best_penalty
+        )
+
+    pred_candidates = np.array(pred_candidates)
+    loss_candidates = np.array(loss_candidates)
+
+    top_idx = np.argsort(loss_candidates)[:N_AVG]
+
+    print("  Top model indices:", top_idx)
+    print(f"  Top {EARLY_STOP_MONITOR} losses:", loss_candidates[top_idx])
+
+    pred_scaled_avg = pred_candidates[top_idx].mean(axis=0).reshape(1, -1)
+
+    # Back to original excess-return units
+    y_pred = y_scaler.inverse_transform(pred_scaled_avg)
+
+    one_result = pd.DataFrame({"date": [t]})
+
+    for i, y in enumerate(y_columns):
+        one_result[f"pred_{y}"] = y_pred[0, i]
+        one_result[f"true_{y}"] = y_test.iloc[0].values[i]
+        one_result[f"hist_{y}"] = hist_mean[i]
+
+    one_result["RUN_SETTING"] = RUN_SETTING
+    one_result["N_MC"] = N_MC
+    one_result["N_AVG"] = N_AVG
+    one_result["VALIDATION_SPLIT"] = VALIDATION_SPLIT
+    one_result["EARLY_STOP_MONITOR"] = EARLY_STOP_MONITOR
+    one_result["N_HIDDEN_LAYERS"] = N_HIDDEN_LAYERS
+    one_result["HIDDEN_NODES"] = HIDDEN_NODES
+    one_result["N_YIELD_PREDICTORS"] = len(x_columns)
+    one_result["N_MACRO_PREDICTORS"] = len(macro_columns)
+    one_result["N_TOTAL_PREDICTORS"] = len(predictor_columns)
+    one_result["loss_best"] = loss_candidates[top_idx[0]]
+    one_result["loss_avg_top"] = loss_candidates[top_idx].mean()
+
+    # Store best selected hyperparameters for traceability
+    one_result["best_dropout"] = dropout_candidates[top_idx[0]]
+    one_result["best_penalty"] = penalty_candidates[top_idx[0]]
+
+    one_result.to_csv(result_file, index=False)
+
+    print("Saved:", result_file)
+
+
+# ==================================================
+# 11. Load saved results
+# ==================================================
+
+pattern = (
+    f"{SAVE_DIR}/result_{model_name}_"
+    f"{mode_name}_"
+    f"{N_HIDDEN_LAYERS}layer_"
+    f"{HIDDEN_NODES}nodes_"
+    f"mc{N_MC}_avg{N_AVG}_"
+    f"*.csv"
+)
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise ValueError("No saved result files found.")
+
+df_out = pd.concat(
+    [pd.read_csv(f) for f in files],
+    axis=0,
+    ignore_index=True
+)
+
+df_out = df_out.sort_values("date").reset_index(drop=True)
+
+df_out_eval = df_out[
+    (df_out["date"] >= OOS_START_DATE)
+    & (df_out["date"] <= OOS_END_DATE)
+].copy()
+
+
+# ==================================================
+# 12. Compute R2 OOS and p-values
+# ==================================================
+
+r2_score_list = []
+p_value_list = []
+
+for y in y_columns:
+    r2_score = r2_oos(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    p_value = rsz_signif(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    r2_score_list.append(r2_score)
+    p_value_list.append(p_value)
+
+df_score = pd.DataFrame(
+    [r2_score_list, p_value_list],
+    index=["R2_oos", "p_value"],
+    columns=y_columns
+)
+
+
+# ==================================================
+# 13. Save final results
+# ==================================================
+
+pred_all_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_all.csv"
+)
+
+pred_eval_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_eval.csv"
+)
+
+score_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"mc{N_MC}_avg{N_AVG}_score_eval.csv"
+)
+
+macro_columns_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"macro_columns_used.csv"
+)
+
+df_out.to_csv(pred_all_path, index=False)
+df_out_eval.to_csv(pred_eval_path, index=False)
+df_score.to_csv(score_path, index=True)
+pd.DataFrame({"macro_columns": macro_columns}).to_csv(macro_columns_path, index=False)
+
+print("Evaluation period:")
+print(df_out_eval["date"].min(), "to", df_out_eval["date"].max())
+
+print("Macro Static NN R2 OOS and p-values:")
+print(df_score)
+
+print("Saved files:")
+print(pred_all_path)
+print(pred_eval_path)
+print(score_path)
+print(macro_columns_path)
