@@ -1,0 +1,597 @@
+##### Lagged Neural Network #####
+##### data_soo.csv version #####
+##### Recursive OOS forecast #####
+##### Saves monthly intermediate files #####
+##### Two settings:
+##### (1) single_no_val: single model, no validation
+##### (2) avg_val: validation-based model averaging
+
+
+import os
+import gc
+import glob
+import random
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers
+
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 0. Settings
+# ==================================================
+
+# ---------- PyCharm version ----------
+# SAVE_DIR = "./LAGGED_NN"
+# os.makedirs(SAVE_DIR, exist_ok=True)
+# DATA_PATH = "../DATA/data_soo.csv"
+
+
+# ---------- Colab version ----------
+from google.colab import drive
+drive.mount('/content/drive')
+
+SAVE_DIR = "/content/drive/MyDrive/AP/Paper/lagged_nn_results"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+DATA_PATH = f"https://drive.google.com/uc?id={file_id}"
+
+
+# ==================================================
+# 1. Experiment options
+# ==================================================
+
+# Choose one:
+# RUN_SETTING = "single_no_val"
+RUN_SETTING = "avg_val"
+
+
+if RUN_SETTING == "single_no_val":
+    USE_ENSEMBLE = False
+    N_MC = 1
+    N_AVG = 1
+    VALIDATION_SPLIT = 0.0
+    EARLY_STOP_MONITOR = "loss"
+
+elif RUN_SETTING == "avg_val":
+    USE_ENSEMBLE = True
+    N_MC = 20
+    N_AVG = 5
+    VALIDATION_SPLIT = 0.15
+    EARLY_STOP_MONITOR = "val_loss"
+
+else:
+    raise ValueError("RUN_SETTING must be either 'single_no_val' or 'avg_val'.")
+
+
+# Lag window
+LOOKBACK = 12
+
+# Important:
+# For comparison with the RNN path model, do NOT include current x_t.
+# Input is [x_{t-12}, ..., x_{t-1}], flattened into one vector.
+INCLUDE_CURRENT_X = False
+
+
+OOS_START_DATE = 1989.01
+OOS_END_DATE = 2017.12
+
+
+# NN architecture
+N_HIDDEN_LAYERS = 1
+HIDDEN_NODES = 7
+ACTIVATION = "relu"
+
+# Training
+EPOCHS = 200
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+PATIENCE = 20
+
+
+# ==================================================
+# 2. Columns
+# ==================================================
+
+x_columns = [
+    "0f1", "1f1", "2f1", "3f1", "4f1",
+    "5f1", "6f1", "7f1", "8f1", "9f1"
+]
+
+y_columns = [
+    "xr24", "xr36", "xr48", "xr60", "xr84", "xr120"
+]
+
+
+# ==================================================
+# 3. Helper functions
+# ==================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)
+
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    numerator = np.nansum((y_true - y_pred) ** 2)
+    denominator = np.nansum((y_true - y_hist_mean) ** 2)
+
+    if denominator == 0:
+        return np.nan
+
+    return 1 - numerator / denominator
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_forecast = np.asarray(y_forecast).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    f = (
+        (y_true - y_hist_mean) ** 2
+        - (y_true - y_forecast) ** 2
+        + (y_hist_mean - y_forecast) ** 2
+    )
+
+    x = np.ones(len(f))
+
+    model = sm.OLS(f, x, missing="drop", hasconst=True)
+    results = model.fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+
+    t_value = np.asarray(results.tvalues).ravel()[0]
+
+    return 1 - tstat.cdf(t_value, results.nobs - 1)
+
+
+# ==================================================
+# 4. Make lagged NN samples
+# ==================================================
+
+def make_lagged_train_samples(data, x_columns, y_columns, lookback, include_current_x=False):
+    """
+    Creates flat lagged input vectors.
+
+    If include_current_x=False:
+        input for target date t:
+            [x_{t-12}, x_{t-11}, ..., x_{t-1}]
+        shape:
+            12 * 10 = 120
+
+    If include_current_x=True:
+        input for target date t:
+            [x_t, x_{t-1}, ..., x_{t-11}]
+        shape:
+            12 * 10 = 120
+
+    Target:
+        xr_t
+    """
+
+    data = data.sort_values("date").reset_index(drop=True)
+
+    X_list = []
+    Y_list = []
+    target_dates = []
+
+    for current_idx in range(lookback, len(data)):
+
+        if include_current_x:
+            # x_t, x_{t-1}, ..., x_{t-11}
+            lag_indices = list(range(current_idx, current_idx - lookback, -1))
+        else:
+            # x_{t-12}, ..., x_{t-1}
+            lag_indices = list(range(current_idx - lookback, current_idx))
+
+        x_block = data.iloc[lag_indices][x_columns]
+        y_target = data.iloc[current_idx][y_columns]
+
+        if x_block.isna().any().any():
+            continue
+
+        if y_target.isna().any():
+            continue
+
+        # Flatten 12 x 10 into 120-dimensional vector
+        x_flat = x_block.values.reshape(-1)
+
+        X_list.append(x_flat)
+        Y_list.append(y_target.values)
+        target_dates.append(data.iloc[current_idx]["date"])
+
+    X = np.array(X_list)
+    Y = np.array(Y_list)
+    target_dates = np.array(target_dates)
+
+    return X, Y, target_dates
+
+
+def make_lagged_test_sample(df_sort, test_index, x_columns, lookback, include_current_x=False):
+    """
+    Builds one test input vector for forecast date t.
+    """
+
+    if include_current_x:
+        lag_indices = list(range(test_index, test_index - lookback, -1))
+    else:
+        lag_indices = list(range(test_index - lookback, test_index))
+
+    if min(lag_indices) < 0:
+        raise ValueError("Not enough historical observations to construct lagged test input.")
+
+    x_block = df_sort.iloc[lag_indices][x_columns]
+
+    if x_block.isna().any().any():
+        raise ValueError("Missing X values in lagged test input.")
+
+    X_test = x_block.values.reshape(1, -1)
+
+    return X_test
+
+
+# ==================================================
+# 5. Build Lagged NN
+# ==================================================
+
+def build_lagged_nn(input_dim, y_dim, hidden_nodes, n_hidden_layers, activation, learning_rate, seed):
+    set_seed(seed)
+
+    model = keras.Sequential(name="lagged_nn")
+
+    model.add(layers.Input(shape=(input_dim,)))
+
+    for layer_id in range(n_hidden_layers):
+        model.add(
+            layers.Dense(
+                hidden_nodes,
+                activation=activation,
+                name=f"hidden_{layer_id + 1}"
+            )
+        )
+
+    model.add(
+        layers.Dense(
+            y_dim,
+            activation="linear",
+            name="output"
+        )
+    )
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse"
+    )
+
+    return model
+
+
+# ==================================================
+# 6. Fit one model
+# ==================================================
+
+def fit_one_lagged_nn(X_train_scaled, Y_train_scaled, X_test_scaled, seed):
+    keras.backend.clear_session()
+
+    model = build_lagged_nn(
+        input_dim=X_train_scaled.shape[1],
+        y_dim=Y_train_scaled.shape[1],
+        hidden_nodes=HIDDEN_NODES,
+        n_hidden_layers=N_HIDDEN_LAYERS,
+        activation=ACTIVATION,
+        learning_rate=LEARNING_RATE,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor=EARLY_STOP_MONITOR,
+        min_delta=1e-6,
+        patience=PATIENCE,
+        verbose=0,
+        mode="auto",
+        restore_best_weights=True
+    )
+
+    history = model.fit(
+        X_train_scaled,
+        Y_train_scaled,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=VALIDATION_SPLIT,
+        shuffle=False,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    model_loss = min(history.history[EARLY_STOP_MONITOR])
+
+    pred_scaled = model.predict(X_test_scaled, verbose=0)
+
+    del model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return pred_scaled, model_loss
+
+
+# ==================================================
+# 7. Load data
+# ==================================================
+
+df = pd.read_csv(DATA_PATH)
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+required_cols = ["date"] + x_columns + y_columns
+missing_cols = [c for c in required_cols if c not in df_sort.columns]
+
+if len(missing_cols) > 0:
+    raise ValueError(f"Missing columns in data_soo.csv: {missing_cols}")
+
+df_sort = df_sort.dropna(subset=x_columns).reset_index(drop=True)
+
+dates = df_sort["date"]
+
+if OOS_START_DATE not in set(dates):
+    raise ValueError(f"OOS_START_DATE {OOS_START_DATE} not found in data.")
+
+date_idx = df_sort[df_sort["date"] == OOS_START_DATE].index[0]
+
+print("Data loaded.")
+print("Date range:", df_sort["date"].min(), "to", df_sort["date"].max())
+print("RUN_SETTING:", RUN_SETTING)
+print("N_MC:", N_MC, "N_AVG:", N_AVG)
+print("VALIDATION_SPLIT:", VALIDATION_SPLIT)
+print("EARLY_STOP_MONITOR:", EARLY_STOP_MONITOR)
+print("INCLUDE_CURRENT_X:", INCLUDE_CURRENT_X)
+
+
+# ==================================================
+# 8. Recursive OOS forecasting
+# ==================================================
+
+mode_name = "single_no_val" if RUN_SETTING == "single_no_val" else "avg_val"
+lag_name = "with_current_x" if INCLUDE_CURRENT_X else "past_only"
+
+for t in dates.iloc[date_idx:]:
+
+    if t > OOS_END_DATE:
+        break
+
+    date_str = f"{t:.2f}".replace(".", "_")
+
+    result_file = (
+        f"{SAVE_DIR}/result_lagged_nn_"
+        f"{mode_name}_"
+        f"{lag_name}_"
+        f"{N_HIDDEN_LAYERS}layer_"
+        f"{HIDDEN_NODES}nodes_"
+        f"lookback{LOOKBACK}_"
+        f"mc{N_MC}_avg{N_AVG}_"
+        f"{date_str}.csv"
+    )
+
+    if os.path.exists(result_file):
+        print("Already done, skip:", t)
+        continue
+
+    print("Forecasting date:", t)
+
+    train = df_sort[df_sort["date"] < t].copy()
+    test = df_sort[df_sort["date"] == t].copy()
+
+    if test.empty:
+        print("  No test observation for date:", t)
+        continue
+
+    if test[y_columns].isna().any(axis=None):
+        print("  Missing target for date, skip:", t)
+        continue
+
+    test_index = test.index[0]
+
+    X_train, Y_train, train_target_dates = make_lagged_train_samples(
+        data=train,
+        x_columns=x_columns,
+        y_columns=y_columns,
+        lookback=LOOKBACK,
+        include_current_x=INCLUDE_CURRENT_X
+    )
+
+    if len(Y_train) == 0:
+        print("  Not enough training samples, skip:", t)
+        continue
+
+    X_test = make_lagged_test_sample(
+        df_sort=df_sort,
+        test_index=test_index,
+        x_columns=x_columns,
+        lookback=LOOKBACK,
+        include_current_x=INCLUDE_CURRENT_X
+    )
+
+    y_test = test[y_columns]
+
+    # Historical mean benchmark
+    hist_mean = pd.DataFrame(Y_train, columns=y_columns).mean().values
+
+    # Scale X using train only
+    x_scaler = StandardScaler()
+    X_train_scaled = x_scaler.fit_transform(X_train)
+    X_test_scaled = x_scaler.transform(X_test)
+
+    # Scale Y using train only
+    y_scaler = StandardScaler()
+    Y_train_scaled = y_scaler.fit_transform(Y_train)
+
+    pred_candidates = []
+    loss_candidates = []
+
+    for seed in range(N_MC):
+        print("  Lagged NN seed:", seed)
+
+        pred_scaled, model_loss = fit_one_lagged_nn(
+            X_train_scaled=X_train_scaled,
+            Y_train_scaled=Y_train_scaled,
+            X_test_scaled=X_test_scaled,
+            seed=seed
+        )
+
+        pred_candidates.append(pred_scaled[0])
+        loss_candidates.append(model_loss)
+
+        print(f"    {EARLY_STOP_MONITOR}:", model_loss)
+
+    pred_candidates = np.array(pred_candidates)
+    loss_candidates = np.array(loss_candidates)
+
+    top_idx = np.argsort(loss_candidates)[:N_AVG]
+
+    print("  Top model indices:", top_idx)
+    print(f"  Top {EARLY_STOP_MONITOR} losses:", loss_candidates[top_idx])
+
+    pred_scaled_avg = pred_candidates[top_idx].mean(axis=0).reshape(1, -1)
+
+    y_pred = y_scaler.inverse_transform(pred_scaled_avg)
+
+    one_result = pd.DataFrame({"date": [t]})
+
+    for i, y in enumerate(y_columns):
+        one_result[f"pred_{y}"] = y_pred[0, i]
+        one_result[f"true_{y}"] = y_test.iloc[0].values[i]
+        one_result[f"hist_{y}"] = hist_mean[i]
+
+    one_result["RUN_SETTING"] = RUN_SETTING
+    one_result["N_MC"] = N_MC
+    one_result["N_AVG"] = N_AVG
+    one_result["LOOKBACK"] = LOOKBACK
+    one_result["INCLUDE_CURRENT_X"] = INCLUDE_CURRENT_X
+    one_result["N_HIDDEN_LAYERS"] = N_HIDDEN_LAYERS
+    one_result["HIDDEN_NODES"] = HIDDEN_NODES
+    one_result["mode"] = mode_name
+    one_result["EARLY_STOP_MONITOR"] = EARLY_STOP_MONITOR
+    one_result["VALIDATION_SPLIT"] = VALIDATION_SPLIT
+    one_result["loss_avg_top"] = loss_candidates[top_idx].mean()
+    one_result["loss_best"] = loss_candidates[top_idx[0]]
+
+    one_result.to_csv(result_file, index=False)
+
+    print("Saved:", result_file)
+
+
+# ==================================================
+# 9. Load saved results
+# ==================================================
+
+pattern = (
+    f"{SAVE_DIR}/result_lagged_nn_"
+    f"{mode_name}_"
+    f"{lag_name}_"
+    f"{N_HIDDEN_LAYERS}layer_"
+    f"{HIDDEN_NODES}nodes_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_"
+    f"*.csv"
+)
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise ValueError("No saved result files found.")
+
+df_out = pd.concat(
+    [pd.read_csv(f) for f in files],
+    axis=0,
+    ignore_index=True
+)
+
+df_out = df_out.sort_values("date").reset_index(drop=True)
+
+df_out_eval = df_out[
+    (df_out["date"] >= OOS_START_DATE)
+    & (df_out["date"] <= OOS_END_DATE)
+].copy()
+
+
+# ==================================================
+# 10. Compute R2 OOS and p-values
+# ==================================================
+
+r2_score_list = []
+p_value_list = []
+
+for y in y_columns:
+    r2_score = r2_oos(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    p_value = rsz_signif(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    r2_score_list.append(r2_score)
+    p_value_list.append(p_value)
+
+df_score = pd.DataFrame(
+    [r2_score_list, p_value_list],
+    index=["R2_oos", "p_value"],
+    columns=y_columns
+)
+
+
+# ==================================================
+# 11. Save final results
+# ==================================================
+
+pred_all_path = (
+    f"{SAVE_DIR}/lagged_nn_"
+    f"{mode_name}_{lag_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_all.csv"
+)
+
+pred_eval_path = (
+    f"{SAVE_DIR}/lagged_nn_"
+    f"{mode_name}_{lag_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_eval.csv"
+)
+
+score_path = (
+    f"{SAVE_DIR}/lagged_nn_"
+    f"{mode_name}_{lag_name}_"
+    f"{N_HIDDEN_LAYERS}layer_{HIDDEN_NODES}nodes_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_score_eval.csv"
+)
+
+df_out.to_csv(pred_all_path, index=False)
+df_out_eval.to_csv(pred_eval_path, index=False)
+df_score.to_csv(score_path, index=True)
+
+print("Evaluation period:")
+print(df_out_eval["date"].min(), "to", df_out_eval["date"].max())
+
+print("Lagged NN R2 OOS and p-values:")
+print(df_score)
+
+print("Saved files:")
+print(pred_all_path)
+print(pred_eval_path)
+print(score_path)
