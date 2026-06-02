@@ -1,0 +1,190 @@
+import os
+import numpy as np
+import pandas as pd
+
+# ==================================================
+# 0. Paths
+# ==================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+SAVE_DIR = "/content/drive/MyDrive/AP/Paper/macro_data"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# data_soo.csv
+data_soo_file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+data_soo_url = f"https://drive.google.com/uc?id={data_soo_file_id}"
+
+# Put 2019-12.csv in this folder, or change this path
+fred_raw_path = "/content/drive/MyDrive/AP/Paper/macro_data/2019-12.csv"
+
+output_path = f"{SAVE_DIR}/data_soo_macro_2019_12.csv"
+macro_only_path = f"{SAVE_DIR}/fred_md_transformed_2019_12.csv"
+
+
+# ==================================================
+# 1. Transformation function
+# ==================================================
+
+def transform_series(x, tcode):
+    """
+    FRED-MD transformation codes:
+    1: x_t
+    2: x_t - x_{t-1}
+    3: second difference
+    4: log(x_t)
+    5: log(x_t) - log(x_{t-1})
+    6: second difference of log(x_t)
+    7: first difference of percent change
+    """
+    x = pd.to_numeric(x, errors="coerce")
+    y = pd.Series(np.nan, index=x.index, dtype=float)
+
+    small = 1e-6
+
+    if tcode == 1:
+        y = x.copy()
+
+    elif tcode == 2:
+        y = x.diff()
+
+    elif tcode == 3:
+        y = x.diff().diff()
+
+    elif tcode == 4:
+        if np.nanmin(x.values) > small:
+            y = np.log(x)
+
+    elif tcode == 5:
+        if np.nanmin(x.values) > small:
+            y = np.log(x).diff()
+
+    elif tcode == 6:
+        if np.nanmin(x.values) > small:
+            y = np.log(x).diff().diff()
+
+    elif tcode == 7:
+        y = (x / x.shift(1) - 1.0).diff()
+
+    else:
+        y[:] = np.nan
+
+    return y
+
+
+# ==================================================
+# 2. Load raw FRED-MD
+# ==================================================
+
+fred_raw = pd.read_csv(fred_raw_path)
+
+# First row is transformation code
+tcode_row = fred_raw.iloc[0].copy()
+
+# Remaining rows are actual data
+fred = fred_raw.iloc[1:].copy().reset_index(drop=True)
+
+# Date
+fred = fred.rename(columns={"sasdate": "date_raw"})
+fred["date_dt"] = pd.to_datetime(fred["date_raw"])
+
+# Match your data_soo date format: 1989.01, 1989.02, ...
+fred["date"] = fred["date_dt"].dt.year + fred["date_dt"].dt.month / 100
+fred["date"] = fred["date"].round(2)
+
+macro_raw_cols = [c for c in fred.columns if c not in ["date_raw", "date_dt", "date"]]
+
+print("Raw FRED-MD shape:", fred.shape)
+print("Number of macro raw columns:", len(macro_raw_cols))
+print("Date range:", fred["date"].min(), "to", fred["date"].max())
+
+
+# ==================================================
+# 3. Transform macro variables
+# ==================================================
+
+macro_transformed = pd.DataFrame({"date": fred["date"]})
+
+for col in macro_raw_cols:
+    try:
+        tcode = int(float(tcode_row[col]))
+    except Exception:
+        continue
+
+    macro_transformed[col] = transform_series(fred[col], tcode)
+
+# Drop columns that are entirely missing after transformation
+all_missing_cols = [
+    c for c in macro_transformed.columns
+    if c != "date" and macro_transformed[c].isna().all()
+]
+
+macro_transformed = macro_transformed.drop(columns=all_missing_cols)
+
+# Drop first two rows because differenced/log-differenced variables create initial NaNs
+macro_transformed = macro_transformed.iloc[2:].reset_index(drop=True)
+
+print("Transformed macro shape:", macro_transformed.shape)
+print("Dropped all-missing columns:", all_missing_cols[:10], "..." if len(all_missing_cols) > 10 else "")
+
+macro_transformed.to_csv(macro_only_path, index=False)
+print("Saved transformed macro data:", macro_only_path)
+
+
+# ==================================================
+# 4. Load data_soo and merge
+# ==================================================
+
+data_soo = pd.read_csv(data_soo_url)
+data_soo["date"] = data_soo["date"].round(2)
+
+merged = pd.merge(
+    data_soo,
+    macro_transformed,
+    on="date",
+    how="left"
+)
+
+print("data_soo shape:", data_soo.shape)
+print("merged shape:", merged.shape)
+print("Merged date range:", merged["date"].min(), "to", merged["date"].max())
+
+# Check missing macro coverage in the relevant sample
+x_columns = [
+    "0f1", "1f1", "2f1", "3f1", "4f1",
+    "5f1", "6f1", "7f1", "8f1", "9f1"
+]
+
+y_columns = [
+    "xr24", "xr36", "xr48", "xr60", "xr84", "xr120"
+]
+
+macro_columns = [
+    c for c in merged.columns
+    if c not in ["date"] + x_columns + y_columns
+]
+
+sample = merged[(merged["date"] >= 1971.08) & (merged["date"] <= 2017.12)].copy()
+
+missing_rate = sample[macro_columns].isna().mean().sort_values(ascending=False)
+
+print("Number of macro columns:", len(macro_columns))
+print("Top missing rates:")
+print(missing_rate.head(20))
+
+# Optional: keep only macro columns with reasonable coverage
+# For example, drop columns with more than 20% missing in 1971.08--2017.12
+keep_macro_columns = missing_rate[missing_rate <= 0.20].index.tolist()
+
+print("Macro columns kept:", len(keep_macro_columns))
+
+final_cols = ["date"] + x_columns + y_columns + keep_macro_columns
+merged_final = merged[final_cols].copy()
+
+merged_final.to_csv(output_path, index=False)
+
+print("Saved merged data:", output_path)
+print("Final shape:", merged_final.shape)
+print("Final columns:")
+print(merged_final.columns.tolist())
