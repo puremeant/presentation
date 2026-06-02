@@ -16,6 +16,14 @@ single model (learning_rate=0.001, batch_size=32, validation_split=0.15, loss='m
        xr24      xr36      xr48      xr60      xr84     xr120
 0 -0.870831 -0.818162 -0.849705 -0.837254 -0.810891 -0.803931
 
+# NN 저자 코드 고려, single, no val
+Evaluation period:
+1989.01 to 2017.12
+R2 OOS and p-values:
+             xr24     xr36      xr48      xr60      xr84     xr120
+R2_oos  -0.282754 -0.16117 -0.079499 -0.166365 -0.129363 -0.059042
+p_value  0.356949  0.37792  0.327841  0.291966  0.303443  0.279195
+
 # RNN single model
 Evaluation period:
 1989.01 to 2017.12
