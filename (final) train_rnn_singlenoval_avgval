@@ -31,14 +31,28 @@ from scipy.stats import t as tstat
 
 
 # ==================================================
-# 1. Colab setting
+# 1. Path setting: Colab / PyCharm option
 # ==================================================
 
-from google.colab import drive
-drive.mount('/content/drive')
+USE_COLAB = True   # Colab이면 True, PyCharm이면 False
 
-SAVE_DIR = "/content/drive/MyDrive/AP/Paper/rnn_yield_only_results"
-os.makedirs(SAVE_DIR, exist_ok=True)
+if USE_COLAB:
+    from google.colab import drive
+    drive.mount('/content/drive')
+
+    SAVE_DIR = "/content/drive/MyDrive/AP/Paper/rnn_yield_only_results"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    # Colab version: load data_soo.csv from Google Drive file id
+    file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
+    DATA_PATH = f"https://drive.google.com/uc?id={file_id}"
+
+else:
+    SAVE_DIR = "./RNN_YIELD_ONLY"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    # PyCharm version: adjust this path if your folder structure is different
+    DATA_PATH = "../DATA/data_soo.csv"
 
 
 # ==================================================
@@ -467,9 +481,7 @@ def fit_one_state_transition_rnn(
 # 9. Load data
 # ==================================================
 
-file_id = "1GzbqOY80SOjQ7_WE79GYq64Eyq9vKUM4"
-url = f"https://drive.google.com/uc?id={file_id}"
-df = pd.read_csv(url)
+df = pd.read_csv(DATA_PATH)
 
 df_sort = df.copy().sort_values("date").reset_index(drop=True)
 df_sort["date"] = df_sort["date"].round(2)
