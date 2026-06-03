@@ -1,0 +1,1072 @@
+##### Macro State-Transition RNN: All-Together Specification #####
+##### data_soo_fredmd_2019_12_balanced.csv version #####
+##### Colab / PyCharm option version #####
+##### Forecast equation: xr_t = g(h_t, m_t) #####
+##### RNN encoder: [x_{t-12}, ..., x_{t-1}] -> h_t #####
+##### Return head: [h_t, m_t] -> shared hidden layer -> xr_t #####
+##### Auxiliary state head: h_t -> x_hat_t #####
+#####
+##### FINAL SETTINGS:
+##### - single_no_val: monitor total loss
+##### - avg_val: monitor val_xr_output_loss
+##### - LSTM layers = 3
+##### - EPOCHS = 500
+##### - BATCH_SIZE = 32
+##### - LEARNING_RATE = 1e-4
+##### - PATIENCE = 100
+##### - STATE_LOSS_WEIGHT = 1.0
+##### - XR_LOSS_WEIGHT = 1.0
+#####
+##### IMPORTANT FIX:
+##### - Remove ALL columns whose names start with "xr" from macro inputs.
+##### - This prevents excess-return leakage from xr2, xr3, xr4, xr5, xr7, xr10, etc.
+#####
+##### Two settings:
+##### (1) single_no_val: single model, no validation
+##### (2) avg_val: validation-based model averaging
+
+
+# ==================================================
+# 0. Imports
+# ==================================================
+
+import os
+import gc
+import glob
+import random
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
+from tensorflow.keras import layers
+
+import statsmodels.api as sm
+from scipy.stats import t as tstat
+
+
+# ==================================================
+# 1. Path setting: Colab / PyCharm option
+# ==================================================
+
+USE_COLAB = True   # Colab이면 True, PyCharm이면 False
+
+if USE_COLAB:
+    from google.colab import drive
+    drive.mount('/content/drive')
+
+    SAVE_DIR = "/content/drive/MyDrive/AP/Paper/rnn_macro_all_together_results"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    DATA_PATH = "/content/drive/MyDrive/AP/Paper/macro_data/data_soo_fredmd_2019_12_balanced.csv"
+
+else:
+    SAVE_DIR = "./RNN_MACRO_ALL_TOGETHER"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    DATA_PATH = "../DATA/data_soo_fredmd_2019_12_balanced.csv"
+
+
+# ==================================================
+# 2. Experiment setting
+# ==================================================
+
+# Choose one:
+# RUN_SETTING = "single_no_val"
+RUN_SETTING = "avg_val"
+
+
+if RUN_SETTING == "single_no_val":
+    USE_ENSEMBLE = False
+    N_MC = 1
+    N_AVG = 1
+    VALIDATION_SPLIT = 0.0
+
+    # Keep original single-model setting.
+    # Single result is selected by total multitask loss.
+    EARLY_STOP_MONITOR = "loss"
+    MODEL_SELECTION_MONITOR = "loss"
+
+elif RUN_SETTING == "avg_val":
+    USE_ENSEMBLE = True
+
+    # Author-style / feasible model averaging
+    N_MC = 100
+    N_AVG = 10
+
+    VALIDATION_SPLIT = 0.15
+
+    # For avg_val, select models by the main return-forecast validation loss,
+    # not by total multitask validation loss.
+    EARLY_STOP_MONITOR = "val_xr_output_loss"
+    MODEL_SELECTION_MONITOR = "val_xr_output_loss"
+
+else:
+    raise ValueError("RUN_SETTING must be either 'single_no_val' or 'avg_val'.")
+
+
+# ==================================================
+# 3. Forecast and model settings
+# ==================================================
+
+OOS_START_DATE = 1989.01
+OOS_END_DATE = 2017.12
+
+LOOKBACK = 12
+
+# RNN architecture
+# N_LAYERS = 3 means:
+# LSTM(32, return_sequences=True)
+# -> LSTM(32, return_sequences=True)
+# -> LSTM(H_DIM, return_sequences=False)
+N_LAYERS = 3
+H_DIM = 64
+DENSE_DIM = 64
+ACTIVATION = "gelu"
+
+# Training
+EPOCHS = 500
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+PATIENCE = 100
+
+# Multi-task loss
+STATE_LOSS_WEIGHT = 1.0
+XR_LOSS_WEIGHT = 1.0
+
+# Dropout after merging h_t and macro variables
+MERGE_DROPOUT = 0.10
+
+
+# ==================================================
+# 4. Columns
+# ==================================================
+
+x_columns = [
+    "0f1", "1f1", "2f1", "3f1", "4f1",
+    "5f1", "6f1", "7f1", "8f1", "9f1"
+]
+
+y_columns = [
+    "xr24", "xr36", "xr48", "xr60", "xr84", "xr120"
+]
+
+
+# ==================================================
+# 5. Helper functions
+# ==================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)
+
+
+def r2_oos(y_true, y_pred, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    numerator = np.nansum((y_true - y_pred) ** 2)
+    denominator = np.nansum((y_true - y_hist_mean) ** 2)
+
+    if denominator == 0:
+        return np.nan
+
+    return 1 - numerator / denominator
+
+
+def rsz_signif(y_true, y_forecast, y_hist_mean):
+    y_true = np.asarray(y_true).ravel()
+    y_forecast = np.asarray(y_forecast).ravel()
+    y_hist_mean = np.asarray(y_hist_mean).ravel()
+
+    f = (
+        (y_true - y_hist_mean) ** 2
+        - (y_true - y_forecast) ** 2
+        + (y_hist_mean - y_forecast) ** 2
+    )
+
+    x = np.ones(len(f))
+
+    model = sm.OLS(f, x, missing="drop", hasconst=True)
+    results = model.fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+
+    t_value = np.asarray(results.tvalues).ravel()[0]
+
+    return 1 - tstat.cdf(t_value, results.nobs - 1)
+
+
+def scale_rnn_sequences(scaler, X_seq):
+    """
+    StandardScaler expects 2D data.
+    RNN input is 3D:
+        (n_samples, lookback, n_features)
+
+    So reshape:
+        (n_samples * lookback, n_features)
+    then reshape back.
+    """
+    n_samples, lookback, n_features = X_seq.shape
+
+    X_scaled = scaler.transform(
+        X_seq.reshape(-1, n_features)
+    ).reshape(n_samples, lookback, n_features)
+
+    return X_scaled
+
+
+def is_xr_column(colname):
+    """
+    Remove every excess-return column from macro inputs.
+
+    Examples removed:
+        xr2, xr3, xr4, xr5, xr7, xr10
+        xr24, xr36, xr48, xr60, xr84, xr120
+        any other column starting with 'xr'
+    """
+    return str(colname).lower().startswith("xr")
+
+
+# ==================================================
+# 6. Make RNN macro samples
+# ==================================================
+
+def make_macro_transition_train_samples(
+    data,
+    x_columns,
+    macro_columns,
+    y_columns,
+    lookback
+):
+    """
+    For target date t:
+
+        RNN path input:
+            x_{t-12}, ..., x_{t-1}
+
+        Auxiliary state target:
+            x_t
+
+        Current macro input:
+            m_t
+
+        Return target:
+            xr_t
+
+    Model:
+        h_t = Phi(x_{t-12}, ..., x_{t-1})
+        x_hat_t = q(h_t)
+        xr_hat_t = g(h_t, m_t)
+
+    Note:
+        m_t is current macro information.
+        If you later want a strictly lagged macro version, shift macro columns by 1 before sample construction.
+    """
+
+    data = data.sort_values("date").reset_index(drop=True)
+
+    past_seq_list = []
+    state_target_list = []
+    macro_input_list = []
+    y_target_list = []
+    target_dates = []
+
+    for current_idx in range(lookback, len(data)):
+
+        past_start = current_idx - lookback
+        past_end = current_idx
+
+        past_seq = data.iloc[past_start:past_end][x_columns]
+        state_target = data.iloc[current_idx][x_columns]
+        macro_input = data.iloc[current_idx][macro_columns]
+        y_target = data.iloc[current_idx][y_columns]
+
+        if past_seq.isna().any().any():
+            continue
+
+        if state_target.isna().any():
+            continue
+
+        if macro_input.isna().any():
+            continue
+
+        if y_target.isna().any():
+            continue
+
+        past_seq_list.append(past_seq.values)
+        state_target_list.append(state_target.values)
+        macro_input_list.append(macro_input.values)
+        y_target_list.append(y_target.values)
+        target_dates.append(data.iloc[current_idx]["date"])
+
+    X_past = np.array(past_seq_list)
+    X_state_target = np.array(state_target_list)
+    M = np.array(macro_input_list)
+    Y = np.array(y_target_list)
+    target_dates = np.array(target_dates)
+
+    return X_past, X_state_target, M, Y, target_dates
+
+
+def make_macro_transition_test_sample(
+    df_sort,
+    test_index,
+    x_columns,
+    macro_columns,
+    lookback
+):
+    """
+    For forecast date t:
+
+        Yield path input:
+            x_{t-12}, ..., x_{t-1}
+
+        Current macro input:
+            m_t
+
+        State target for diagnostics:
+            x_t
+    """
+
+    past_start = test_index - lookback
+    past_end = test_index
+
+    if past_start < 0:
+        raise ValueError("Not enough historical observations to construct test sequence.")
+
+    X_past_test = df_sort.iloc[past_start:past_end][x_columns].values
+    X_past_test = X_past_test.reshape(1, lookback, len(x_columns))
+
+    M_test = df_sort.iloc[test_index][macro_columns].values
+    M_test = M_test.reshape(1, len(macro_columns))
+
+    X_state_test = df_sort.iloc[test_index][x_columns].values
+    X_state_test = X_state_test.reshape(1, len(x_columns))
+
+    return X_past_test, M_test, X_state_test
+
+
+# ==================================================
+# 7. Build macro all-together RNN
+# ==================================================
+
+def build_macro_all_together_rnn(
+    lookback,
+    x_dim,
+    macro_dim,
+    y_dim,
+    n_layers,
+    h_dim,
+    dense_dim,
+    activation,
+    learning_rate,
+    seed
+):
+    """
+    RNN all-together macro model:
+
+        past yield path -> h_t
+        [h_t, m_t] -> shared return hidden layer -> xr_t
+
+    Macro variables and the learned path state interact inside the same return head.
+    """
+
+    set_seed(seed)
+
+    # ------------------------------
+    # RNN path input
+    # ------------------------------
+    past_input = keras.Input(
+        shape=(lookback, x_dim),
+        name="past_yield_curve_path"
+    )
+
+    hidden_layer = past_input
+
+    # If N_LAYERS=1, skip this loop and use only final LSTM.
+    # If N_LAYERS=3, this creates two sequence LSTMs before final LSTM.
+    for layer_id in range(max(n_layers - 1, 0)):
+        hidden_layer = layers.LSTM(
+            32,
+            return_sequences=True,
+            recurrent_initializer="orthogonal",
+            name=f"lstm_sequence_{layer_id + 1}"
+        )(hidden_layer)
+
+        hidden_layer = layers.LayerNormalization(
+            name=f"layer_norm_sequence_{layer_id + 1}"
+        )(hidden_layer)
+
+    # Final LSTM summarizes the past path into h_t
+    rep_layer = layers.LSTM(
+        h_dim,
+        return_sequences=False,
+        recurrent_initializer="orthogonal",
+        name="path_representation_lstm"
+    )(hidden_layer)
+
+    rep_layer = layers.LayerNormalization(
+        name="path_representation_norm"
+    )(rep_layer)
+
+    # ------------------------------
+    # Current macro input
+    # ------------------------------
+    macro_input = keras.Input(
+        shape=(macro_dim,),
+        name="macro_information"
+    )
+
+    macro_norm = layers.LayerNormalization(
+        name="macro_norm"
+    )(macro_input)
+
+    # ------------------------------
+    # Auxiliary state-transition head
+    # h_t -> x_hat_t
+    # ------------------------------
+    state_hidden = layers.Dense(
+        dense_dim,
+        activation=activation,
+        name="state_transition_hidden"
+    )(rep_layer)
+
+    state_output = layers.Dense(
+        x_dim,
+        activation="linear",
+        name="state_output"
+    )(state_hidden)
+
+    # ------------------------------
+    # Main return forecast head
+    # [h_t, m_t] -> shared hidden layer -> xr_t
+    # ------------------------------
+    xr_input = layers.Concatenate(
+        name="merge_path_state_and_macro"
+    )([rep_layer, macro_norm])
+
+    xr_input = layers.Dropout(
+        MERGE_DROPOUT,
+        name="dropout_after_macro_merge"
+    )(xr_input)
+
+    xr_hidden = layers.Dense(
+        dense_dim,
+        activation=activation,
+        name="xr_forecast_hidden"
+    )(xr_input)
+
+    xr_output = layers.Dense(
+        y_dim,
+        activation="linear",
+        name="xr_output"
+    )(xr_hidden)
+
+    model = keras.Model(
+        inputs=[past_input, macro_input],
+        outputs=[state_output, xr_output],
+        name="macro_all_together_state_transition_rnn"
+    )
+
+    optimizer = keras.optimizers.Adam(
+        learning_rate=learning_rate
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss={
+            "state_output": "mse",
+            "xr_output": "mse"
+        },
+        loss_weights={
+            "state_output": STATE_LOSS_WEIGHT,
+            "xr_output": XR_LOSS_WEIGHT
+        }
+    )
+
+    return model
+
+
+# ==================================================
+# 8. Fit one RNN
+# ==================================================
+
+def fit_one_macro_all_together_rnn(
+    X_past_train_scaled,
+    X_state_train_scaled,
+    M_train_scaled,
+    Y_train_scaled,
+    X_past_test_scaled,
+    M_test_scaled,
+    seed
+):
+    keras.backend.clear_session()
+
+    model = build_macro_all_together_rnn(
+        lookback=X_past_train_scaled.shape[1],
+        x_dim=X_past_train_scaled.shape[2],
+        macro_dim=M_train_scaled.shape[1],
+        y_dim=Y_train_scaled.shape[1],
+        n_layers=N_LAYERS,
+        h_dim=H_DIM,
+        dense_dim=DENSE_DIM,
+        activation=ACTIVATION,
+        learning_rate=LEARNING_RATE,
+        seed=seed
+    )
+
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor=EARLY_STOP_MONITOR,
+        min_delta=1e-6,
+        patience=PATIENCE,
+        verbose=0,
+        mode="auto",
+        restore_best_weights=True
+    )
+
+    history = model.fit(
+        [X_past_train_scaled, M_train_scaled],
+        {
+            "state_output": X_state_train_scaled,
+            "xr_output": Y_train_scaled
+        },
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=VALIDATION_SPLIT,
+        shuffle=False,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    if MODEL_SELECTION_MONITOR not in history.history:
+        print("Available history keys:")
+        print(list(history.history.keys()))
+        raise KeyError(
+            f"{MODEL_SELECTION_MONITOR} not found in history.history."
+        )
+
+    model_loss = min(history.history[MODEL_SELECTION_MONITOR])
+
+    # Diagnostics only
+    total_loss = min(history.history["loss"]) if "loss" in history.history else np.nan
+    xr_loss = min(history.history["xr_output_loss"]) if "xr_output_loss" in history.history else np.nan
+    state_loss = min(history.history["state_output_loss"]) if "state_output_loss" in history.history else np.nan
+
+    if VALIDATION_SPLIT > 0:
+        total_val_loss = min(history.history["val_loss"]) if "val_loss" in history.history else np.nan
+        val_xr_loss = min(history.history["val_xr_output_loss"]) if "val_xr_output_loss" in history.history else np.nan
+        val_state_loss = min(history.history["val_state_output_loss"]) if "val_state_output_loss" in history.history else np.nan
+    else:
+        total_val_loss = np.nan
+        val_xr_loss = np.nan
+        val_state_loss = np.nan
+
+    pred_state_scaled, pred_xr_scaled = model.predict(
+        [X_past_test_scaled, M_test_scaled],
+        verbose=0
+    )
+
+    del model
+    keras.backend.clear_session()
+    gc.collect()
+
+    return (
+        pred_state_scaled,
+        pred_xr_scaled,
+        model_loss,
+        total_loss,
+        xr_loss,
+        state_loss,
+        total_val_loss,
+        val_xr_loss,
+        val_state_loss
+    )
+
+
+# ==================================================
+# 9. Load data
+# ==================================================
+
+df = pd.read_csv(DATA_PATH)
+
+df_sort = df.copy().sort_values("date").reset_index(drop=True)
+df_sort["date"] = df_sort["date"].round(2)
+
+required_base_cols = ["date"] + x_columns + y_columns
+missing_base_cols = [
+    c for c in required_base_cols
+    if c not in df_sort.columns
+]
+
+if len(missing_base_cols) > 0:
+    raise ValueError(f"Missing required columns: {missing_base_cols}")
+
+
+# ==================================================
+# IMPORTANT FIX: remove all xr columns from macro inputs
+# ==================================================
+
+all_xr_columns = [
+    c for c in df_sort.columns
+    if is_xr_column(c)
+]
+
+macro_columns = [
+    c for c in df_sort.columns
+    if c not in ["date"] + x_columns + all_xr_columns
+]
+
+# Keep only numeric macro columns
+macro_columns = [
+    c for c in macro_columns
+    if pd.api.types.is_numeric_dtype(df_sort[c])
+]
+
+# Safety check
+bad_macro_columns = [
+    c for c in macro_columns
+    if is_xr_column(c)
+]
+
+if len(bad_macro_columns) > 0:
+    raise ValueError(f"Leakage risk: xr columns found in macro_columns: {bad_macro_columns}")
+
+if len(macro_columns) == 0:
+    raise ValueError("No macro columns found after excluding date, yield columns, and all xr columns.")
+
+print("All xr columns excluded from macro input:")
+print(all_xr_columns)
+
+print("Number of macro columns used:", len(macro_columns))
+print("First 20 macro columns:")
+print(macro_columns[:20])
+
+df_sort = df_sort.dropna(subset=x_columns + macro_columns).reset_index(drop=True)
+
+dates = df_sort["date"]
+
+if OOS_START_DATE not in set(dates):
+    raise ValueError(f"OOS_START_DATE {OOS_START_DATE} not found in data.")
+
+date_idx = df_sort[df_sort["date"] == OOS_START_DATE].index[0]
+
+print("Data loaded.")
+print("Date range:", df_sort["date"].min(), "to", df_sort["date"].max())
+print("Number of yield predictors:", len(x_columns))
+print("Number of macro predictors:", len(macro_columns))
+print("RUN_SETTING:", RUN_SETTING)
+print("N_MC:", N_MC, "N_AVG:", N_AVG)
+print("VALIDATION_SPLIT:", VALIDATION_SPLIT)
+print("EARLY_STOP_MONITOR:", EARLY_STOP_MONITOR)
+print("MODEL_SELECTION_MONITOR:", MODEL_SELECTION_MONITOR)
+print("N_LAYERS:", N_LAYERS)
+print("H_DIM:", H_DIM)
+print("DENSE_DIM:", DENSE_DIM)
+print("EPOCHS:", EPOCHS)
+print("BATCH_SIZE:", BATCH_SIZE)
+print("LEARNING_RATE:", LEARNING_RATE)
+print("PATIENCE:", PATIENCE)
+print("STATE_LOSS_WEIGHT:", STATE_LOSS_WEIGHT)
+print("XR_LOSS_WEIGHT:", XR_LOSS_WEIGHT)
+
+
+# ==================================================
+# 10. Recursive OOS forecasting
+# ==================================================
+
+model_name = "rnn_macro_all_together"
+mode_name = RUN_SETTING
+monitor_name = MODEL_SELECTION_MONITOR.replace("val_", "v").replace("_", "")
+loss_name = f"state{STATE_LOSS_WEIGHT:g}_xr{XR_LOSS_WEIGHT:g}".replace(".", "p")
+
+for t in dates.iloc[date_idx:]:
+
+    if t > OOS_END_DATE:
+        break
+
+    date_str = f"{t:.2f}".replace(".", "_")
+
+    result_file = (
+        f"{SAVE_DIR}/result_{model_name}_"
+        f"{mode_name}_"
+        f"select_{monitor_name}_"
+        f"{loss_name}_"
+        f"layers{N_LAYERS}_"
+        f"h{H_DIM}_"
+        f"lookback{LOOKBACK}_"
+        f"mc{N_MC}_avg{N_AVG}_"
+        f"{date_str}.csv"
+    )
+
+    if os.path.exists(result_file):
+        print("Already done, skip:", t)
+        continue
+
+    print("Forecasting date:", t)
+
+    train = df_sort[df_sort["date"] < t].copy()
+    test = df_sort[df_sort["date"] == t].copy()
+
+    if test.empty:
+        print("  No test observation for date:", t)
+        continue
+
+    if test[y_columns].isna().any(axis=None):
+        print("  Missing target for date, skip:", t)
+        continue
+
+    test_index = test.index[0]
+
+    X_past_train, X_state_train, M_train, Y_train, train_target_dates = make_macro_transition_train_samples(
+        data=train,
+        x_columns=x_columns,
+        macro_columns=macro_columns,
+        y_columns=y_columns,
+        lookback=LOOKBACK
+    )
+
+    if len(Y_train) == 0:
+        print("  Not enough training samples, skip:", t)
+        continue
+
+    X_past_test, M_test, X_state_test = make_macro_transition_test_sample(
+        df_sort=df_sort,
+        test_index=test_index,
+        x_columns=x_columns,
+        macro_columns=macro_columns,
+        lookback=LOOKBACK
+    )
+
+    y_test = test[y_columns]
+    x_state_test = test[x_columns]
+
+    # Historical mean benchmark
+    hist_mean = pd.DataFrame(Y_train, columns=y_columns).mean().values
+
+    # ------------------------------
+    # Scale yield path/state using train only
+    # ------------------------------
+    x_scaler = StandardScaler()
+    x_scaler.fit(train[x_columns].dropna().values)
+
+    X_past_train_scaled = scale_rnn_sequences(x_scaler, X_past_train)
+    X_past_test_scaled = scale_rnn_sequences(x_scaler, X_past_test)
+
+    X_state_train_scaled = x_scaler.transform(X_state_train)
+
+    # ------------------------------
+    # Scale current macro using train only
+    # ------------------------------
+    macro_scaler = StandardScaler()
+    macro_scaler.fit(train[macro_columns].dropna().values)
+
+    M_train_scaled = macro_scaler.transform(M_train)
+    M_test_scaled = macro_scaler.transform(M_test)
+
+    # ------------------------------
+    # Scale Y using train only
+    # ------------------------------
+    y_scaler = StandardScaler()
+    Y_train_scaled = y_scaler.fit_transform(Y_train)
+
+    pred_xr_candidates = []
+    pred_state_candidates = []
+
+    loss_candidates = []
+    total_loss_candidates = []
+    xr_loss_candidates = []
+    state_loss_candidates = []
+    total_val_loss_candidates = []
+    val_xr_loss_candidates = []
+    val_state_loss_candidates = []
+
+    for seed in range(N_MC):
+        print("  Macro all-together RNN seed:", seed)
+
+        (
+            pred_state_scaled,
+            pred_xr_scaled,
+            model_loss,
+            total_loss,
+            xr_loss,
+            state_loss,
+            total_val_loss,
+            val_xr_loss,
+            val_state_loss
+        ) = fit_one_macro_all_together_rnn(
+            X_past_train_scaled=X_past_train_scaled,
+            X_state_train_scaled=X_state_train_scaled,
+            M_train_scaled=M_train_scaled,
+            Y_train_scaled=Y_train_scaled,
+            X_past_test_scaled=X_past_test_scaled,
+            M_test_scaled=M_test_scaled,
+            seed=seed
+        )
+
+        pred_xr_candidates.append(pred_xr_scaled[0])
+        pred_state_candidates.append(pred_state_scaled[0])
+
+        loss_candidates.append(model_loss)
+        total_loss_candidates.append(total_loss)
+        xr_loss_candidates.append(xr_loss)
+        state_loss_candidates.append(state_loss)
+        total_val_loss_candidates.append(total_val_loss)
+        val_xr_loss_candidates.append(val_xr_loss)
+        val_state_loss_candidates.append(val_state_loss)
+
+        print(
+            f"    {MODEL_SELECTION_MONITOR}:",
+            model_loss,
+            "| loss:", total_loss,
+            "| xr_loss:", xr_loss,
+            "| val_loss:", total_val_loss,
+            "| val_xr_loss:", val_xr_loss
+        )
+
+    pred_xr_candidates = np.array(pred_xr_candidates)
+    pred_state_candidates = np.array(pred_state_candidates)
+
+    loss_candidates = np.array(loss_candidates)
+    total_loss_candidates = np.array(total_loss_candidates)
+    xr_loss_candidates = np.array(xr_loss_candidates)
+    state_loss_candidates = np.array(state_loss_candidates)
+    total_val_loss_candidates = np.array(total_val_loss_candidates)
+    val_xr_loss_candidates = np.array(val_xr_loss_candidates)
+    val_state_loss_candidates = np.array(val_state_loss_candidates)
+
+    top_idx = np.argsort(loss_candidates)[:N_AVG]
+
+    print("  Top model indices:", top_idx)
+    print(f"  Top {MODEL_SELECTION_MONITOR} losses:", loss_candidates[top_idx])
+
+    pred_xr_scaled_avg = pred_xr_candidates[top_idx].mean(axis=0).reshape(1, -1)
+    pred_state_scaled_avg = pred_state_candidates[top_idx].mean(axis=0).reshape(1, -1)
+
+    y_pred = y_scaler.inverse_transform(pred_xr_scaled_avg)
+    x_state_pred = x_scaler.inverse_transform(pred_state_scaled_avg)
+
+    one_result = pd.DataFrame({"date": [t]})
+
+    for i, y in enumerate(y_columns):
+        one_result[f"pred_{y}"] = y_pred[0, i]
+        one_result[f"true_{y}"] = y_test.iloc[0].values[i]
+        one_result[f"hist_{y}"] = hist_mean[i]
+
+    for i, x in enumerate(x_columns):
+        one_result[f"pred_state_{x}"] = x_state_pred[0, i]
+        one_result[f"true_state_{x}"] = x_state_test.iloc[0].values[i]
+
+    one_result["RUN_SETTING"] = RUN_SETTING
+    one_result["N_MC"] = N_MC
+    one_result["N_AVG"] = N_AVG
+    one_result["VALIDATION_SPLIT"] = VALIDATION_SPLIT
+    one_result["EARLY_STOP_MONITOR"] = EARLY_STOP_MONITOR
+    one_result["MODEL_SELECTION_MONITOR"] = MODEL_SELECTION_MONITOR
+    one_result["LOOKBACK"] = LOOKBACK
+    one_result["N_LAYERS"] = N_LAYERS
+    one_result["H_DIM"] = H_DIM
+    one_result["DENSE_DIM"] = DENSE_DIM
+    one_result["N_MACRO_PREDICTORS"] = len(macro_columns)
+    one_result["STATE_LOSS_WEIGHT"] = STATE_LOSS_WEIGHT
+    one_result["XR_LOSS_WEIGHT"] = XR_LOSS_WEIGHT
+    one_result["MERGE_DROPOUT"] = MERGE_DROPOUT
+
+    one_result["loss_best"] = loss_candidates[top_idx[0]]
+    one_result["loss_avg_top"] = loss_candidates[top_idx].mean()
+
+    one_result["total_loss_best"] = total_loss_candidates[top_idx[0]]
+    one_result["total_loss_avg_top"] = total_loss_candidates[top_idx].mean()
+
+    one_result["xr_loss_best"] = xr_loss_candidates[top_idx[0]]
+    one_result["xr_loss_avg_top"] = xr_loss_candidates[top_idx].mean()
+
+    one_result["state_loss_best"] = state_loss_candidates[top_idx[0]]
+    one_result["state_loss_avg_top"] = state_loss_candidates[top_idx].mean()
+
+    one_result["total_val_loss_best"] = total_val_loss_candidates[top_idx[0]]
+    one_result["total_val_loss_avg_top"] = total_val_loss_candidates[top_idx].mean()
+
+    one_result["val_xr_loss_best"] = val_xr_loss_candidates[top_idx[0]]
+    one_result["val_xr_loss_avg_top"] = val_xr_loss_candidates[top_idx].mean()
+
+    one_result["val_state_loss_best"] = val_state_loss_candidates[top_idx[0]]
+    one_result["val_state_loss_avg_top"] = val_state_loss_candidates[top_idx].mean()
+
+    one_result.to_csv(result_file, index=False)
+
+    print("Saved:", result_file)
+
+
+# ==================================================
+# 11. Load saved results
+# ==================================================
+
+pattern = (
+    f"{SAVE_DIR}/result_{model_name}_"
+    f"{mode_name}_"
+    f"select_{monitor_name}_"
+    f"{loss_name}_"
+    f"layers{N_LAYERS}_"
+    f"h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_"
+    f"*.csv"
+)
+
+files = sorted(glob.glob(pattern))
+
+if len(files) == 0:
+    raise ValueError("No saved result files found.")
+
+df_out = pd.concat(
+    [pd.read_csv(f) for f in files],
+    axis=0,
+    ignore_index=True
+)
+
+df_out = df_out.sort_values("date").reset_index(drop=True)
+
+df_out_eval = df_out[
+    (df_out["date"] >= OOS_START_DATE)
+    & (df_out["date"] <= OOS_END_DATE)
+].copy()
+
+
+# ==================================================
+# 12. Compute R2 OOS and p-values
+# ==================================================
+
+r2_score_list = []
+p_value_list = []
+
+for y in y_columns:
+    r2_score = r2_oos(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    p_value = rsz_signif(
+        df_out_eval[f"true_{y}"],
+        df_out_eval[f"pred_{y}"],
+        df_out_eval[f"hist_{y}"]
+    )
+
+    r2_score_list.append(r2_score)
+    p_value_list.append(p_value)
+
+df_score = pd.DataFrame(
+    [r2_score_list, p_value_list],
+    index=["R2_oos", "p_value"],
+    columns=y_columns
+)
+
+
+# ==================================================
+# 13. State prediction diagnostics
+# ==================================================
+
+state_mse_list = []
+state_r2_list = []
+
+for x in x_columns:
+    true_x = df_out_eval[f"true_state_{x}"]
+    pred_x = df_out_eval[f"pred_state_{x}"]
+
+    mse = ((true_x - pred_x) ** 2).mean()
+
+    denominator = ((true_x - true_x.mean()) ** 2).sum()
+    numerator = ((true_x - pred_x) ** 2).sum()
+
+    state_r2 = 1 - numerator / denominator if denominator != 0 else np.nan
+
+    state_mse_list.append(mse)
+    state_r2_list.append(state_r2)
+
+df_state_score = pd.DataFrame(
+    [state_mse_list, state_r2_list],
+    index=["state_mse", "state_R2"],
+    columns=x_columns
+)
+
+
+# ==================================================
+# 14. Save final results
+# ==================================================
+
+pred_all_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"select_{monitor_name}_"
+    f"{loss_name}_"
+    f"layers{N_LAYERS}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_all.csv"
+)
+
+pred_eval_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"select_{monitor_name}_"
+    f"{loss_name}_"
+    f"layers{N_LAYERS}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_predictions_eval.csv"
+)
+
+score_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"select_{monitor_name}_"
+    f"{loss_name}_"
+    f"layers{N_LAYERS}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_score_eval.csv"
+)
+
+state_score_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"select_{monitor_name}_"
+    f"{loss_name}_"
+    f"layers{N_LAYERS}_h{H_DIM}_"
+    f"lookback{LOOKBACK}_"
+    f"mc{N_MC}_avg{N_AVG}_state_score_eval.csv"
+)
+
+macro_columns_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"macro_columns_used.csv"
+)
+
+excluded_xr_columns_path = (
+    f"{SAVE_DIR}/{model_name}_"
+    f"{mode_name}_"
+    f"excluded_xr_columns.csv"
+)
+
+df_out.to_csv(pred_all_path, index=False)
+df_out_eval.to_csv(pred_eval_path, index=False)
+df_score.to_csv(score_path, index=True)
+df_state_score.to_csv(state_score_path, index=True)
+pd.DataFrame({"macro_columns": macro_columns}).to_csv(macro_columns_path, index=False)
+pd.DataFrame({"excluded_xr_columns": all_xr_columns}).to_csv(excluded_xr_columns_path, index=False)
+
+print("Evaluation period:")
+print(df_out_eval["date"].min(), "to", df_out_eval["date"].max())
+
+print("Macro all-together RNN R2 OOS and p-values:")
+print(df_score)
+
+print("State prediction diagnostics:")
+print(df_state_score)
+
+print("Saved files:")
+print(pred_all_path)
+print(pred_eval_path)
+print(score_path)
+print(state_score_path)
+print(macro_columns_path)
+print(excluded_xr_columns_path)
