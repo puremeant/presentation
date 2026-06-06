@@ -1,0 +1,174 @@
+첫 번째, **Main impact figure**: Yield + Macro validation-based averaging에서 
+`Static NN all-together`, `Static NN f-net`, `RNN joint path f-net`를 만기별 line plot으로 보여줘.
+이게 가장 방어적이야. 
+Single 결과는 너무 좋아 보여서 공격받을 수 있는데, validation-based averaging은 보수적이고 benchmark paper와도 연결돼.
+
+두 번째, **Appendix impact figure**: Yield + Macro single에서 RNN all-together/current/path/joint를 보여줘. 
+여기서는 “current macro보다 macro path가 훨씬 좋다”는 메시지가 강하게 살아.
+아래 코드는 네 보안 환경 안에서 결과 CSV를 읽고, **그림 그리는 데 필요한 집계 숫자만 print**해주는 코드야. 월별 예측값은 출력하지 않아.
+
+```python
+import pandas as pd
+import numpy as np
+
+# ==================================================
+# 1. Set result file paths
+# ==================================================
+# 각 모델의 predictions_eval.csv 경로로 바꿔줘.
+# 파일에는 date, true_xr24, pred_xr24, hist_xr24 ... 컬럼이 있어야 함.
+
+FILES = {
+    # Yield-only
+    "yield_static_nn_avg": "PATH_TO/yield_static_nn_avg_predictions_eval.csv",
+    "yield_lagged_nn_avg": "PATH_TO/yield_lagged_nn_avg_predictions_eval.csv",
+    "yield_rnn_avg": "PATH_TO/yield_rnn_avg_predictions_eval.csv",
+
+    # Macro avg
+    "macro_nn_all_avg": "PATH_TO/macro_nn_all_avg_predictions_eval.csv",
+    "macro_nn_fnet_avg": "PATH_TO/macro_nn_fnet_avg_predictions_eval.csv",
+    "macro_rnn_joint_avg": "PATH_TO/macro_rnn_joint_avg_predictions_eval.csv",
+
+    # Macro single, optional
+    "macro_rnn_all_single": "PATH_TO/macro_rnn_all_single_predictions_eval.csv",
+    "macro_rnn_current_single": "PATH_TO/macro_rnn_current_single_predictions_eval.csv",
+    "macro_rnn_path_single": "PATH_TO/macro_rnn_path_single_predictions_eval.csv",
+    "macro_rnn_joint_single": "PATH_TO/macro_rnn_joint_single_predictions_eval.csv",
+}
+
+Y_COLS = ["xr24", "xr36", "xr48", "xr60", "xr84", "xr120"]
+MATURITIES = [2, 3, 4, 5, 7, 10]
+
+
+# ==================================================
+# 2. R2 OOS function
+# ==================================================
+
+def r2_oos_from_prediction_file(path, y_cols=Y_COLS):
+    df = pd.read_csv(path).sort_values("date").reset_index(drop=True)
+
+    out = {}
+
+    for y in y_cols:
+        true_col = f"true_{y}"
+        pred_col = f"pred_{y}"
+        hist_col = f"hist_{y}"
+
+        if true_col not in df.columns:
+            raise ValueError(f"Missing column: {true_col}")
+        if pred_col not in df.columns:
+            raise ValueError(f"Missing column: {pred_col}")
+        if hist_col not in df.columns:
+            raise ValueError(f"Missing column: {hist_col}")
+
+        y_true = df[true_col].to_numpy()
+        y_pred = df[pred_col].to_numpy()
+        y_hist = df[hist_col].to_numpy()
+
+        sse_model = np.nansum((y_true - y_pred) ** 2)
+        sse_hist = np.nansum((y_true - y_hist) ** 2)
+
+        r2 = 1 - sse_model / sse_hist
+        out[y] = 100 * r2
+
+    return out
+
+
+# ==================================================
+# 3. Print clean numbers for plotting
+# ==================================================
+
+rows = []
+
+for model_name, path in FILES.items():
+    if path.startswith("PATH_TO"):
+        continue
+
+    r2_dict = r2_oos_from_prediction_file(path)
+
+    row = {"model": model_name}
+    for mat, y in zip(MATURITIES, Y_COLS):
+        row[f"xr{mat}"] = r2_dict[y]
+
+    rows.append(row)
+
+result = pd.DataFrame(rows)
+
+print("\n=== R2 OOS by maturity, percent ===")
+print(result.to_csv(index=False, float_format="%.2f"))
+
+
+# ==================================================
+# 4. Optional: print LaTeX table rows
+# ==================================================
+
+print("\n=== LaTeX rows ===")
+for _, row in result.iterrows():
+    values = []
+    for mat in MATURITIES:
+        values.append(f"${row[f'xr{mat}']:.1f}\\%$")
+    print(row["model"].replace("_", " ") + " & " + " & ".join(values) + r" \\")
+```
+
+그리고 네가 **prediction CSV 없이 이미 score_eval.csv만 있다면**, 아래 코드가 더 간단해. `score_eval.csv`는 index가 `R2_oos`, `p_value`이고 columns가 `xr24...xr120`인 파일이라고 가정해.
+
+```python
+import pandas as pd
+
+FILES = {
+    "macro_nn_all_avg": "PATH_TO/score_eval.csv",
+    "macro_nn_fnet_avg": "PATH_TO/score_eval.csv",
+    "macro_rnn_joint_avg": "PATH_TO/score_eval.csv",
+}
+
+Y_COLS = ["xr24", "xr36", "xr48", "xr60", "xr84", "xr120"]
+MATURITIES = [2, 3, 4, 5, 7, 10]
+
+rows = []
+
+for model_name, path in FILES.items():
+    if path.startswith("PATH_TO"):
+        continue
+
+    score = pd.read_csv(path, index_col=0)
+
+    row = {"model": model_name}
+    for mat, y in zip(MATURITIES, Y_COLS):
+        row[f"xr{mat}"] = 100 * float(score.loc["R2_oos", y])
+    rows.append(row)
+
+result = pd.DataFrame(rows)
+
+print("\n=== R2 OOS by maturity, percent ===")
+print(result.to_csv(index=False, float_format="%.2f"))
+
+print("\n=== Copy-paste Python dictionary for plotting outside ===")
+print("{")
+for _, row in result.iterrows():
+    vals = [round(row[f"xr{mat}"], 2) for mat in MATURITIES]
+    print(f'    "{row["model"]}": {vals},')
+print("}")
+```
+
+그림은 이렇게 구성하는 걸 추천해.
+
+**Main slide figure 제목:**
+`Maturity Profile of OOS Predictability`
+
+**넣을 선:**
+`Static NN all-together avg`, `Static NN f-net avg`, `RNN joint path f-net avg`.
+
+**메시지:**
+“RNN joint path improves over static NN macro benchmarks across all maturities, with the largest gain at shorter maturities.”
+
+그리고 appendix에는 single 결과로:
+
+**Appendix figure 제목:**
+`Macro Information Structure: Current vs Historical Paths`
+
+**넣을 선:**
+`RNN all-together single`, `RNN current macro f-net single`, `RNN macro path f-net single`, `RNN joint path f-net single`.
+
+**메시지:**
+“Historical macro paths dominate current macro snapshots, supporting the path-dependence interpretation.”
+
+이미 네가 숫자를 직접 적을 수 있다면, 내가 다음 답변에서 바로 **그 숫자 입력용 plotting code**도 만들어줄게. CSV 없이 코드 안에 숫자만 넣어서 PNG 저장하는 버전으로.
