@@ -398,8 +398,6 @@ df_out = pd.concat(
 df_out = df_out.sort_values("date").reset_index(drop=True)
 
 
-## 네가 논문 sample을 “realized return이 2018.12까지”라고 맞추고 싶다면, 마지막 predictor date는 보통 2017.12가 맞아. 
-왜냐하면 row 2017.12의 xr는 2017.12 → 2018.12 1년 보유 초과수익률이고, row 2018.12의 xr는 2018.12 → 2019.12가 필요.
 # ==================================================
 # 8. Compute R2 OOS and p-value
 #    Use only predictor dates whose 1-year-ahead returns end by 2018.12
